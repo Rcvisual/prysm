@@ -39,18 +39,6 @@ type stateRootHasher struct {
 	rootsCache *ristretto.Cache
 }
 
-// HashTreeRootState provides a fully-customized version of ssz.HashTreeRoot
-// for the BeaconState type of the official Ethereum Serenity specification.
-// The reason for this particular function is to optimize for speed and memory allocation
-// at the expense of complete specificity (that is, this function can only be used
-// on the Prysm BeaconState data structure).
-func HashTreeRootState(state *pb.BeaconState) ([32]byte, error) {
-	if featureconfig.Get().EnableSSZCache {
-		return cachedHasher.hashTreeRootState(state)
-	}
-	return nocachedHasher.hashTreeRootState(state)
-}
-
 // ComputeFieldRoots returns the hash tree root computations of every field in
 // the beacon state as a list of 32 byte roots.
 func ComputeFieldRoots(state *pb.BeaconState) ([][]byte, error) {
@@ -60,30 +48,12 @@ func ComputeFieldRoots(state *pb.BeaconState) ([][]byte, error) {
 	return nocachedHasher.computeFieldRoots(state)
 }
 
-func (h *stateRootHasher) hashTreeRootState(state *pb.BeaconState) ([32]byte, error) {
-	var fieldRoots [][]byte
-	var err error
-	if featureconfig.Get().EnableSSZCache {
-		fieldRoots, err = cachedHasher.computeFieldRoots(state)
-		if err != nil {
-			return [32]byte{}, err
-		}
-	} else {
-		fieldRoots, err = nocachedHasher.computeFieldRoots(state)
-		if err != nil {
-			return [32]byte{}, err
-		}
-	}
-	return htrutils.BitwiseMerkleize(hashutil.CustomSHA256Hasher(), fieldRoots, uint64(len(fieldRoots)), uint64(len(fieldRoots)))
-}
-
 func (h *stateRootHasher) computeFieldRoots(state *pb.BeaconState) ([][]byte, error) {
 	if state == nil {
 		return nil, errors.New("nil state")
 	}
 	hasher := hashutil.CustomSHA256Hasher()
-	// There are 21 fields in the beacon state.
-	fieldRoots := make([][]byte, 21)
+	fieldRoots := make([][]byte, params.BeaconConfig().BeaconStateFieldCount)
 
 	// Genesis time root.
 	genesisRoot := htrutils.Uint64Root(state.GenesisTime)
@@ -95,7 +65,7 @@ func (h *stateRootHasher) computeFieldRoots(state *pb.BeaconState) ([][]byte, er
 	fieldRoots[1] = r[:]
 
 	// Slot root.
-	slotRoot := htrutils.Uint64Root(state.Slot)
+	slotRoot := htrutils.Uint64Root(uint64(state.Slot))
 	fieldRoots[2] = slotRoot[:]
 
 	// Fork data structure root.
@@ -113,14 +83,14 @@ func (h *stateRootHasher) computeFieldRoots(state *pb.BeaconState) ([][]byte, er
 	fieldRoots[4] = headerHashTreeRoot[:]
 
 	// BlockRoots array root.
-	blockRootsRoot, err := h.arraysRoot(state.BlockRoots, params.BeaconConfig().SlotsPerHistoricalRoot, "BlockRoots")
+	blockRootsRoot, err := h.arraysRoot(state.BlockRoots, uint64(params.BeaconConfig().SlotsPerHistoricalRoot), "BlockRoots")
 	if err != nil {
 		return nil, errors.Wrap(err, "could not compute block roots merkleization")
 	}
 	fieldRoots[5] = blockRootsRoot[:]
 
 	// StateRoots array root.
-	stateRootsRoot, err := h.arraysRoot(state.StateRoots, params.BeaconConfig().SlotsPerHistoricalRoot, "StateRoots")
+	stateRootsRoot, err := h.arraysRoot(state.StateRoots, uint64(params.BeaconConfig().SlotsPerHistoricalRoot), "StateRoots")
 	if err != nil {
 		return nil, errors.Wrap(err, "could not compute state roots merkleization")
 	}
@@ -168,7 +138,7 @@ func (h *stateRootHasher) computeFieldRoots(state *pb.BeaconState) ([][]byte, er
 	fieldRoots[12] = balancesRoot[:]
 
 	// RandaoMixes array root.
-	randaoRootsRoot, err := h.arraysRoot(state.RandaoMixes, params.BeaconConfig().EpochsPerHistoricalVector, "RandaoMixes")
+	randaoRootsRoot, err := h.arraysRoot(state.RandaoMixes, uint64(params.BeaconConfig().EpochsPerHistoricalVector), "RandaoMixes")
 	if err != nil {
 		return nil, errors.Wrap(err, "could not compute randao roots merkleization")
 	}

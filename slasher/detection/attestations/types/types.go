@@ -5,6 +5,7 @@ package types
 import (
 	"errors"
 
+	types "github.com/prysmaticlabs/eth2-types"
 	"github.com/prysmaticlabs/prysm/shared/bytesutil"
 )
 
@@ -31,17 +32,17 @@ const (
 // finding the attestation for the slashing proof.
 type DetectionResult struct {
 	ValidatorIndex uint64
-	SlashableEpoch uint64
+	SlashableEpoch types.Epoch
 	Kind           DetectionKind
 	SigBytes       [2]byte
 }
 
 // Marshal the result into bytes, used for removing duplicates.
-func (result *DetectionResult) Marshal() []byte {
-	numBytes := bytesutil.ToBytes(result.SlashableEpoch, 8)
+func (r *DetectionResult) Marshal() []byte {
+	numBytes := bytesutil.ToBytes(uint64(r.SlashableEpoch), 8)
 	var resultBytes []byte
-	resultBytes = append(resultBytes, uint8(result.Kind))
-	resultBytes = append(resultBytes, result.SigBytes[:]...)
+	resultBytes = append(resultBytes, uint8(r.Kind))
+	resultBytes = append(resultBytes, r.SigBytes[:]...)
 	resultBytes = append(resultBytes, numBytes...)
 	return resultBytes
 }
@@ -58,26 +59,35 @@ type Span struct {
 var SpannerEncodedLength = uint64(7)
 
 // UnmarshalSpan returns a span from an encoded, flattened byte array.
+// Note: This is a very often used function, so it is as optimized as possible.
 func UnmarshalSpan(enc []byte) (Span, error) {
 	r := Span{}
 	if len(enc) != int(SpannerEncodedLength) {
 		return r, errors.New("wrong data length for min max span")
 	}
-	r.MinSpan = bytesutil.FromBytes2(enc[:2])
-	r.MaxSpan = bytesutil.FromBytes2(enc[2:4])
+	r.MinSpan = uint16(enc[0]) | uint16(enc[1])<<8
+	r.MaxSpan = uint16(enc[2]) | uint16(enc[3])<<8
 	sigB := [2]byte{}
 	copy(sigB[:], enc[4:6])
 	r.SigBytes = sigB
-	r.HasAttested = bytesutil.ToBool(enc[6])
+	r.HasAttested = enc[6]&1 == 1
 	return r, nil
 }
 
 // Marshal converts the span struct into a flattened byte array.
-func (span Span) Marshal() []byte {
-	return append(append(append(
-		bytesutil.Bytes2(uint64(span.MinSpan)),
-		bytesutil.Bytes2(uint64(span.MaxSpan))...),
-		span.SigBytes[:]...),
-		bytesutil.FromBool(span.HasAttested),
-	)
+// Note: This is a very often used function, so it is as optimized as possible.
+func (s Span) Marshal() []byte {
+	var attested byte = 0
+	if s.HasAttested {
+		attested = 1
+	}
+	return []byte{
+		byte(s.MinSpan),
+		byte(s.MinSpan >> 8),
+		byte(s.MaxSpan),
+		byte(s.MaxSpan >> 8),
+		s.SigBytes[0],
+		s.SigBytes[1],
+		attested,
+	}
 }

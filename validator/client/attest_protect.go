@@ -2,52 +2,83 @@ package client
 
 import (
 	"context"
-	"errors"
+	"encoding/hex"
 	"fmt"
 
+	"github.com/pkg/errors"
 	ethpb "github.com/prysmaticlabs/ethereumapis/eth/v1alpha1"
-	slashpb "github.com/prysmaticlabs/prysm/proto/slashing"
 	"github.com/prysmaticlabs/prysm/shared/featureconfig"
-	"github.com/prysmaticlabs/prysm/shared/params"
+	"github.com/prysmaticlabs/prysm/shared/slashutil"
+	"github.com/prysmaticlabs/prysm/validator/db/kv"
+	"go.opencensus.io/trace"
 )
 
-var failedPreAttSignLocalErr = "attempted to make slashable attestation, rejected by local slashing protection"
-var failedPreAttSignExternalErr = "attempted to make slashable attestation, rejected by external slasher service"
-var failedPostAttSignExternalErr = "external slasher service detected a submitted slashable attestation"
+var failedAttLocalProtectionErr = "attempted to make slashable attestation, rejected by local slashing protection"
+var failedPostAttSignExternalErr = "attempted to make slashable attestation, rejected by external slasher service"
 
-func (v *validator) preAttSignValidations(ctx context.Context, indexedAtt *ethpb.IndexedAttestation, pubKey [48]byte) error {
-	fmtKey := fmt.Sprintf("%#x", pubKey[:])
-	if featureconfig.Get().LocalProtection {
-		v.attesterHistoryByPubKeyLock.RLock()
-		attesterHistory := v.attesterHistoryByPubKey[pubKey]
-		v.attesterHistoryByPubKeyLock.RUnlock()
-		if isNewAttSlashable(attesterHistory, indexedAtt.Data.Source.Epoch, indexedAtt.Data.Target.Epoch) {
-			if v.emitAccountMetrics {
-				ValidatorAttestFailVec.WithLabelValues(fmtKey).Inc()
-			}
-			return errors.New(failedPreAttSignLocalErr)
+// Checks if an attestation is slashable by comparing it with the attesting
+// history for the given public key in our DB. If it is not, we then update the history
+// with new values and save it to the database.
+func (v *validator) slashableAttestationCheck(
+	ctx context.Context,
+	indexedAtt *ethpb.IndexedAttestation,
+	pubKey [48]byte,
+	signingRoot [32]byte,
+) error {
+	ctx, span := trace.StartSpan(ctx, "validator.postAttSignUpdate")
+	defer span.End()
+
+	// Based on EIP3076, validator should refuse to sign any attestation with source epoch less
+	// than the minimum source epoch present in that signer’s attestations.
+	lowestSourceEpoch, exists, err := v.db.LowestSignedSourceEpoch(ctx, pubKey)
+	if err != nil {
+		return err
+	}
+	if exists && indexedAtt.Data.Source.Epoch < lowestSourceEpoch {
+		return fmt.Errorf(
+			"could not sign attestation lower than lowest source epoch in db, %d < %d",
+			indexedAtt.Data.Source.Epoch,
+			lowestSourceEpoch,
+		)
+	}
+	existingSigningRoot, err := v.db.SigningRootAtTargetEpoch(ctx, pubKey, indexedAtt.Data.Target.Epoch)
+	if err != nil {
+		return err
+	}
+	signingRootsDiffer := slashutil.SigningRootsDiffer(existingSigningRoot, signingRoot)
+
+	// Based on EIP3076, validator should refuse to sign any attestation with target epoch less
+	// than or equal to the minimum target epoch present in that signer’s attestations.
+	lowestTargetEpoch, exists, err := v.db.LowestSignedTargetEpoch(ctx, pubKey)
+	if err != nil {
+		return err
+	}
+	if signingRootsDiffer && exists && indexedAtt.Data.Target.Epoch <= lowestTargetEpoch {
+		return fmt.Errorf(
+			"could not sign attestation lower than or equal to lowest target epoch in db, %d <= %d",
+			indexedAtt.Data.Target.Epoch,
+			lowestTargetEpoch,
+		)
+	}
+	fmtKey := "0x" + hex.EncodeToString(pubKey[:])
+	slashingKind, err := v.db.CheckSlashableAttestation(ctx, pubKey, signingRoot, indexedAtt)
+	if err != nil {
+		if v.emitAccountMetrics {
+			ValidatorAttestFailVec.WithLabelValues(fmtKey).Inc()
 		}
+		switch slashingKind {
+		case kv.DoubleVote:
+			log.Warn("Attestation is slashable as it is a double vote")
+		case kv.SurroundingVote:
+			log.Warn("Attestation is slashable as it is surrounding a previous attestation")
+		case kv.SurroundedVote:
+			log.Warn("Attestation is slashable as it is surrounded by a previous attestation")
+		}
+		return errors.Wrap(err, failedAttLocalProtectionErr)
 	}
 
-	if featureconfig.Get().SlasherProtection && v.protector != nil {
-		if !v.protector.CheckAttestationSafety(ctx, indexedAtt) {
-			if v.emitAccountMetrics {
-				ValidatorAttestFailVecSlasher.WithLabelValues(fmtKey).Inc()
-			}
-			return errors.New(failedPreAttSignExternalErr)
-		}
-	}
-	return nil
-}
-
-func (v *validator) postAttSignUpdate(ctx context.Context, indexedAtt *ethpb.IndexedAttestation, pubKey [48]byte) error {
-	fmtKey := fmt.Sprintf("%#x", pubKey[:])
-	if featureconfig.Get().LocalProtection {
-		v.attesterHistoryByPubKeyLock.Lock()
-		attesterHistory := v.attesterHistoryByPubKey[pubKey]
-		attesterHistory = markAttestationForTargetEpoch(attesterHistory, indexedAtt.Data.Source.Epoch, indexedAtt.Data.Target.Epoch)
-		v.attesterHistoryByPubKey[pubKey] = attesterHistory
-		v.attesterHistoryByPubKeyLock.Unlock()
+	if err := v.db.SaveAttestationForPubKey(ctx, pubKey, signingRoot, indexedAtt); err != nil {
+		return errors.Wrap(err, "could not save attestation history for validator public key")
 	}
 
 	if featureconfig.Get().SlasherProtection && v.protector != nil {
@@ -59,69 +90,4 @@ func (v *validator) postAttSignUpdate(ctx context.Context, indexedAtt *ethpb.Ind
 		}
 	}
 	return nil
-}
-
-// isNewAttSlashable uses the attestation history to determine if an attestation of sourceEpoch
-// and targetEpoch would be slashable. It can detect double, surrounding, and surrounded votes.
-func isNewAttSlashable(history *slashpb.AttestationHistory, sourceEpoch uint64, targetEpoch uint64) bool {
-	farFuture := params.BeaconConfig().FarFutureEpoch
-	wsPeriod := params.BeaconConfig().WeakSubjectivityPeriod
-
-	// Previously pruned, we should return false.
-	if int(targetEpoch) <= int(history.LatestEpochWritten)-int(wsPeriod) {
-		return false
-	}
-
-	// Check if there has already been a vote for this target epoch.
-	if safeTargetToSource(history, targetEpoch) != farFuture {
-		return true
-	}
-
-	// Check if the new attestation would be surrounding another attestation.
-	for i := sourceEpoch; i <= targetEpoch; i++ {
-		// Unattested for epochs are marked as FAR_FUTURE_EPOCH.
-		if safeTargetToSource(history, i) == farFuture {
-			continue
-		}
-		if history.TargetToSource[i%wsPeriod] > sourceEpoch {
-			return true
-		}
-	}
-
-	// Check if the new attestation is being surrounded.
-	for i := targetEpoch; i <= history.LatestEpochWritten; i++ {
-		if safeTargetToSource(history, i) < sourceEpoch {
-			return true
-		}
-	}
-
-	return false
-}
-
-// markAttestationForTargetEpoch returns the modified attestation history with the passed-in epochs marked
-// as attested for. This is done to prevent the validator client from signing any slashable attestations.
-func markAttestationForTargetEpoch(history *slashpb.AttestationHistory, sourceEpoch uint64, targetEpoch uint64) *slashpb.AttestationHistory {
-	wsPeriod := params.BeaconConfig().WeakSubjectivityPeriod
-
-	if targetEpoch > history.LatestEpochWritten {
-		// If the target epoch to mark is ahead of latest written epoch, override the old targets and mark the requested epoch.
-		// Limit the overwriting to one weak subjectivity period as further is not needed.
-		maxToWrite := history.LatestEpochWritten + wsPeriod
-		for i := history.LatestEpochWritten + 1; i < targetEpoch && i <= maxToWrite; i++ {
-			history.TargetToSource[i%wsPeriod] = params.BeaconConfig().FarFutureEpoch
-		}
-		history.LatestEpochWritten = targetEpoch
-	}
-	history.TargetToSource[targetEpoch%wsPeriod] = sourceEpoch
-	return history
-}
-
-// safeTargetToSource makes sure the epoch accessed is within bounds, and if it's not it at
-// returns the "default" FAR_FUTURE_EPOCH value.
-func safeTargetToSource(history *slashpb.AttestationHistory, targetEpoch uint64) uint64 {
-	wsPeriod := params.BeaconConfig().WeakSubjectivityPeriod
-	if targetEpoch > history.LatestEpochWritten || int(targetEpoch) < int(history.LatestEpochWritten)-int(wsPeriod) {
-		return params.BeaconConfig().FarFutureEpoch
-	}
-	return history.TargetToSource[targetEpoch%wsPeriod]
 }

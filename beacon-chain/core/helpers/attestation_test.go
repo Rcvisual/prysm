@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	types "github.com/prysmaticlabs/eth2-types"
 	ethpb "github.com/prysmaticlabs/ethereumapis/eth/v1alpha1"
 	"github.com/prysmaticlabs/prysm/beacon-chain/core/helpers"
 	beaconstate "github.com/prysmaticlabs/prysm/beacon-chain/state"
@@ -12,60 +13,21 @@ import (
 	"github.com/prysmaticlabs/prysm/shared/bls"
 	"github.com/prysmaticlabs/prysm/shared/bytesutil"
 	"github.com/prysmaticlabs/prysm/shared/params"
-	"github.com/prysmaticlabs/prysm/shared/roughtime"
 	"github.com/prysmaticlabs/prysm/shared/testutil"
+	"github.com/prysmaticlabs/prysm/shared/testutil/assert"
+	"github.com/prysmaticlabs/prysm/shared/testutil/require"
+	"github.com/prysmaticlabs/prysm/shared/timeutils"
 )
-
-func TestAttestation_SlotSignature(t *testing.T) {
-	priv := bls.RandKey()
-	pub := priv.PublicKey()
-	state, err := beaconstate.InitializeFromProto(&pb.BeaconState{
-		Fork: &pb.Fork{
-			CurrentVersion:  params.BeaconConfig().GenesisForkVersion,
-			PreviousVersion: params.BeaconConfig().GenesisForkVersion,
-			Epoch:           0,
-		},
-		Slot: 100,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	slot := uint64(101)
-
-	sig, err := helpers.SlotSignature(state, slot, priv)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	domain, err := helpers.Domain(state.Fork(), helpers.CurrentEpoch(state),
-		params.BeaconConfig().DomainBeaconAttester, state.GenesisValidatorRoot())
-	if err != nil {
-		t.Fatal(err)
-	}
-	msg, err := helpers.ComputeSigningRoot(slot, domain)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !sig.Verify(pub, msg[:]) {
-		t.Error("Could not verify slot signature")
-	}
-}
 
 func TestAttestation_IsAggregator(t *testing.T) {
 	t.Run("aggregator", func(t *testing.T) {
 		beaconState, privKeys := testutil.DeterministicGenesisState(t, 100)
 		committee, err := helpers.BeaconCommitteeFromState(beaconState, 0, 0)
-		if err != nil {
-			t.Fatal(err)
-		}
+		require.NoError(t, err)
 		sig := privKeys[0].Sign([]byte{'A'})
 		agg, err := helpers.IsAggregator(uint64(len(committee)), sig.Marshal())
-		if err != nil {
-			t.Fatal(err)
-		}
-		if !agg {
-			t.Error("Wanted aggregator true, got false")
-		}
+		require.NoError(t, err)
+		assert.Equal(t, true, agg, "Wanted aggregator true")
 	})
 
 	t.Run("not aggregator", func(t *testing.T) {
@@ -74,17 +36,11 @@ func TestAttestation_IsAggregator(t *testing.T) {
 		beaconState, privKeys := testutil.DeterministicGenesisState(t, 2048)
 
 		committee, err := helpers.BeaconCommitteeFromState(beaconState, 0, 0)
-		if err != nil {
-			t.Fatal(err)
-		}
+		require.NoError(t, err)
 		sig := privKeys[0].Sign([]byte{'A'})
 		agg, err := helpers.IsAggregator(uint64(len(committee)), sig.Marshal())
-		if err != nil {
-			t.Fatal(err)
-		}
-		if agg {
-			t.Error("Wanted aggregator false, got true")
-		}
+		require.NoError(t, err)
+		assert.Equal(t, false, agg, "Wanted aggregator false")
 	})
 }
 
@@ -94,7 +50,8 @@ func TestAttestation_AggregateSignature(t *testing.T) {
 		atts := make([]*ethpb.Attestation, 0, 100)
 		msg := bytesutil.ToBytes32([]byte("hello"))
 		for i := 0; i < 100; i++ {
-			priv := bls.RandKey()
+			priv, err := bls.RandKey()
+			require.NoError(t, err)
 			pub := priv.PublicKey()
 			sig := priv.Sign(msg[:])
 			pubkeys = append(pubkeys, pub)
@@ -102,12 +59,8 @@ func TestAttestation_AggregateSignature(t *testing.T) {
 			atts = append(atts, att)
 		}
 		aggSig, err := helpers.AggregateSignature(atts)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if !aggSig.FastAggregateVerify(pubkeys, msg) {
-			t.Error("Signature did not verify")
-		}
+		require.NoError(t, err)
+		assert.Equal(t, true, aggSig.FastAggregateVerify(pubkeys, msg), "Signature did not verify")
 	})
 
 	t.Run("not verified", func(t *testing.T) {
@@ -115,20 +68,17 @@ func TestAttestation_AggregateSignature(t *testing.T) {
 		atts := make([]*ethpb.Attestation, 0, 100)
 		msg := []byte("hello")
 		for i := 0; i < 100; i++ {
-			priv := bls.RandKey()
+			priv, err := bls.RandKey()
+			require.NoError(t, err)
 			pub := priv.PublicKey()
-			sig := priv.Sign(msg[:])
+			sig := priv.Sign(msg)
 			pubkeys = append(pubkeys, pub)
 			att := &ethpb.Attestation{Signature: sig.Marshal()}
 			atts = append(atts, att)
 		}
 		aggSig, err := helpers.AggregateSignature(atts[0 : len(atts)-2])
-		if err != nil {
-			t.Fatal(err)
-		}
-		if aggSig.FastAggregateVerify(pubkeys, bytesutil.ToBytes32(msg)) {
-			t.Error("Signature not suppose to verify")
-		}
+		require.NoError(t, err)
+		assert.Equal(t, false, aggSig.FastAggregateVerify(pubkeys, bytesutil.ToBytes32(msg)), "Signature not suppose to verify")
 	})
 }
 
@@ -155,9 +105,7 @@ func TestAttestation_ComputeSubnetForAttestation(t *testing.T) {
 		StateRoots:  make([][]byte, params.BeaconConfig().SlotsPerHistoricalRoot),
 		RandaoMixes: make([][]byte, params.BeaconConfig().EpochsPerHistoricalVector),
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	att := &ethpb.Attestation{
 		AggregationBits: []byte{'A'},
 		Data: &ethpb.AttestationData{
@@ -173,13 +121,9 @@ func TestAttestation_ComputeSubnetForAttestation(t *testing.T) {
 		XXX_sizecache:        0,
 	}
 	valCount, err := helpers.ActiveValidatorCount(state, helpers.SlotToEpoch(att.Data.Slot))
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	sub := helpers.ComputeSubnetForAttestation(valCount, att)
-	if sub != 6 {
-		t.Errorf("Did not get correct subnet for attestation, wanted %d but got %d", 6, sub)
-	}
+	assert.Equal(t, uint64(6), sub, "Did not get correct subnet for attestation")
 }
 
 func Test_ValidateAttestationTime(t *testing.T) {
@@ -188,81 +132,207 @@ func Test_ValidateAttestationTime(t *testing.T) {
 	}
 
 	type args struct {
-		attSlot     uint64
+		attSlot     types.Slot
 		genesisTime time.Time
 	}
 	tests := []struct {
-		name    string
-		args    args
-		wantErr bool
+		name      string
+		args      args
+		wantedErr string
 	}{
 		{
 			name: "attestation.slot == current_slot",
 			args: args{
 				attSlot:     15,
-				genesisTime: roughtime.Now().Add(-15 * time.Duration(params.BeaconConfig().SecondsPerSlot) * time.Second),
+				genesisTime: timeutils.Now().Add(-15 * time.Duration(params.BeaconConfig().SecondsPerSlot) * time.Second),
 			},
-			wantErr: false,
 		},
 		{
 			name: "attestation.slot == current_slot, received in middle of slot",
 			args: args{
 				attSlot: 15,
-				genesisTime: roughtime.Now().Add(
+				genesisTime: timeutils.Now().Add(
 					-15 * time.Duration(params.BeaconConfig().SecondsPerSlot) * time.Second,
 				).Add(-(time.Duration(params.BeaconConfig().SecondsPerSlot/2) * time.Second)),
 			},
-			wantErr: false,
 		},
 		{
 			name: "attestation.slot == current_slot, received 200ms early",
 			args: args{
 				attSlot: 16,
-				genesisTime: roughtime.Now().Add(
+				genesisTime: timeutils.Now().Add(
 					-16 * time.Duration(params.BeaconConfig().SecondsPerSlot) * time.Second,
 				).Add(-200 * time.Millisecond),
 			},
-			wantErr: false,
 		},
 		{
 			name: "attestation.slot > current_slot",
 			args: args{
 				attSlot:     16,
-				genesisTime: roughtime.Now().Add(-15 * time.Duration(params.BeaconConfig().SecondsPerSlot) * time.Second),
+				genesisTime: timeutils.Now().Add(-15 * time.Duration(params.BeaconConfig().SecondsPerSlot) * time.Second),
 			},
-			wantErr: true,
+			wantedErr: "not within attestation propagation range",
 		},
 		{
 			name: "attestation.slot < current_slot-ATTESTATION_PROPAGATION_SLOT_RANGE",
 			args: args{
 				attSlot:     100 - params.BeaconNetworkConfig().AttestationPropagationSlotRange - 1,
-				genesisTime: roughtime.Now().Add(-100 * time.Duration(params.BeaconConfig().SecondsPerSlot) * time.Second),
+				genesisTime: timeutils.Now().Add(-100 * time.Duration(params.BeaconConfig().SecondsPerSlot) * time.Second),
 			},
-			wantErr: true,
+			wantedErr: "not within attestation propagation range",
 		},
 		{
 			name: "attestation.slot = current_slot-ATTESTATION_PROPAGATION_SLOT_RANGE",
 			args: args{
 				attSlot:     100 - params.BeaconNetworkConfig().AttestationPropagationSlotRange,
-				genesisTime: roughtime.Now().Add(-100 * time.Duration(params.BeaconConfig().SecondsPerSlot) * time.Second),
+				genesisTime: timeutils.Now().Add(-100 * time.Duration(params.BeaconConfig().SecondsPerSlot) * time.Second),
 			},
-			wantErr: false,
 		},
 		{
 			name: "attestation.slot = current_slot-ATTESTATION_PROPAGATION_SLOT_RANGE, received 200ms late",
 			args: args{
 				attSlot: 100 - params.BeaconNetworkConfig().AttestationPropagationSlotRange,
-				genesisTime: roughtime.Now().Add(
+				genesisTime: timeutils.Now().Add(
 					-100 * time.Duration(params.BeaconConfig().SecondsPerSlot) * time.Second,
 				).Add(200 * time.Millisecond),
 			},
-			wantErr: false,
+		},
+		{
+			name: "attestation.slot is well beyond current slot",
+			args: args{
+				attSlot:     1 << 32,
+				genesisTime: timeutils.Now().Add(-15 * time.Duration(params.BeaconConfig().SecondsPerSlot) * time.Second),
+			},
+			wantedErr: "which exceeds max allowed value relative to the local clock",
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if err := helpers.ValidateAttestationTime(tt.args.attSlot, tt.args.genesisTime); (err != nil) != tt.wantErr {
-				t.Errorf("validateAggregateAttTime() error = %v, wantErr %v", err, tt.wantErr)
+			err := helpers.ValidateAttestationTime(tt.args.attSlot, tt.args.genesisTime)
+			if tt.wantedErr != "" {
+				assert.ErrorContains(t, tt.wantedErr, err)
+			} else {
+				assert.NoError(t, err)
+			}
+		})
+	}
+}
+
+func TestVerifyCheckpointEpoch_Ok(t *testing.T) {
+	// Genesis was 6 epochs ago exactly.
+	offset := params.BeaconConfig().SlotsPerEpoch.Mul(params.BeaconConfig().SecondsPerSlot * 6)
+	genesis := time.Now().Add(-1 * time.Second * time.Duration(offset))
+	assert.Equal(t, true, helpers.VerifyCheckpointEpoch(&ethpb.Checkpoint{Epoch: 6}, genesis))
+	assert.Equal(t, true, helpers.VerifyCheckpointEpoch(&ethpb.Checkpoint{Epoch: 5}, genesis))
+	assert.Equal(t, false, helpers.VerifyCheckpointEpoch(&ethpb.Checkpoint{Epoch: 4}, genesis))
+	assert.Equal(t, false, helpers.VerifyCheckpointEpoch(&ethpb.Checkpoint{Epoch: 2}, genesis))
+}
+
+func TestValidateNilAttestation(t *testing.T) {
+	tests := []struct {
+		name        string
+		attestation *ethpb.Attestation
+		errString   string
+	}{
+		{
+			name:        "nil attestation",
+			attestation: nil,
+			errString:   "attestation can't be nil",
+		},
+		{
+			name:        "nil attestation data",
+			attestation: &ethpb.Attestation{},
+			errString:   "attestation's data can't be nil",
+		},
+		{
+			name: "nil attestation source",
+			attestation: &ethpb.Attestation{
+				Data: &ethpb.AttestationData{
+					Source: nil,
+					Target: &ethpb.Checkpoint{},
+				},
+			},
+			errString: "attestation's source can't be nil",
+		},
+		{
+			name: "nil attestation target",
+			attestation: &ethpb.Attestation{
+				Data: &ethpb.AttestationData{
+					Target: nil,
+					Source: &ethpb.Checkpoint{},
+				},
+			},
+			errString: "attestation's target can't be nil",
+		},
+		{
+			name: "nil attestation bitfield",
+			attestation: &ethpb.Attestation{
+				Data: &ethpb.AttestationData{
+					Target: &ethpb.Checkpoint{},
+					Source: &ethpb.Checkpoint{},
+				},
+			},
+			errString: "attestation's bitfield can't be nil",
+		},
+		{
+			name: "good attestation",
+			attestation: &ethpb.Attestation{
+				Data: &ethpb.AttestationData{
+					Target: &ethpb.Checkpoint{},
+					Source: &ethpb.Checkpoint{},
+				},
+				AggregationBits: []byte{},
+			},
+			errString: "",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.errString != "" {
+				require.ErrorContains(t, tt.errString, helpers.ValidateNilAttestation(tt.attestation))
+			} else {
+				require.NoError(t, helpers.ValidateNilAttestation(tt.attestation))
+			}
+		})
+	}
+}
+
+func TestValidateSlotTargetEpoch(t *testing.T) {
+	tests := []struct {
+		name        string
+		attestation *ethpb.Attestation
+		errString   string
+	}{
+		{
+			name: "incorrect slot",
+			attestation: &ethpb.Attestation{
+				Data: &ethpb.AttestationData{
+					Target: &ethpb.Checkpoint{Epoch: 1},
+					Source: &ethpb.Checkpoint{},
+				},
+				AggregationBits: []byte{},
+			},
+			errString: "slot 0 does not match target epoch 1",
+		},
+		{
+			name: "good attestation",
+			attestation: &ethpb.Attestation{
+				Data: &ethpb.AttestationData{
+					Slot:   2 * params.BeaconConfig().SlotsPerEpoch,
+					Target: &ethpb.Checkpoint{Epoch: 2},
+					Source: &ethpb.Checkpoint{},
+				},
+				AggregationBits: []byte{},
+			},
+			errString: "",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.errString != "" {
+				require.ErrorContains(t, tt.errString, helpers.ValidateSlotTargetEpoch(tt.attestation.Data))
+			} else {
+				require.NoError(t, helpers.ValidateSlotTargetEpoch(tt.attestation.Data))
 			}
 		})
 	}

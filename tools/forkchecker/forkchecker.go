@@ -17,6 +17,7 @@ import (
 	"time"
 
 	ptypes "github.com/gogo/protobuf/types"
+	types "github.com/prysmaticlabs/eth2-types"
 	pb "github.com/prysmaticlabs/ethereumapis/eth/v1alpha1"
 	"github.com/prysmaticlabs/prysm/shared/params"
 	"github.com/sirupsen/logrus"
@@ -54,14 +55,11 @@ func main() {
 
 	ticker := time.NewTicker(time.Duration(params.BeaconConfig().SecondsPerSlot) * time.Second)
 	go func() {
-		for {
-			select {
-			case <-ticker.C:
-				if *compare {
-					compareHeads(clients)
-				} else {
-					displayHeads(clients)
-				}
+		for range ticker.C {
+			if *compare {
+				compareHeads(clients)
+			} else {
+				displayHeads(clients)
 			}
 		}
 	}()
@@ -109,7 +107,7 @@ func compareHeads(clients map[string]pb.BeaconChainClient) {
 			if (head1.HeadSlot+1)%params.BeaconConfig().SlotsPerEpoch == 0 {
 				p, err := clients[endpt2].GetValidatorParticipation(context.Background(), &pb.GetValidatorParticipationRequest{
 					QueryFilter: &pb.GetValidatorParticipationRequest_Epoch{
-						Epoch: head2.HeadSlot / params.BeaconConfig().SlotsPerEpoch,
+						Epoch: types.Epoch(head2.HeadSlot / params.BeaconConfig().SlotsPerEpoch),
 					},
 				})
 				if err != nil {

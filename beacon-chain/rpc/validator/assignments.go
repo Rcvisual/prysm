@@ -4,6 +4,7 @@ import (
 	"context"
 	"time"
 
+	types "github.com/prysmaticlabs/eth2-types"
 	ethpb "github.com/prysmaticlabs/ethereumapis/eth/v1alpha1"
 	"github.com/prysmaticlabs/prysm/beacon-chain/cache"
 	"github.com/prysmaticlabs/prysm/beacon-chain/core/feed"
@@ -13,8 +14,8 @@ import (
 	"github.com/prysmaticlabs/prysm/shared/bytesutil"
 	"github.com/prysmaticlabs/prysm/shared/params"
 	"github.com/prysmaticlabs/prysm/shared/rand"
-	"github.com/prysmaticlabs/prysm/shared/roughtime"
 	"github.com/prysmaticlabs/prysm/shared/slotutil"
+	"github.com/prysmaticlabs/prysm/shared/timeutils"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -38,10 +39,13 @@ func (vs *Server) StreamDuties(req *ethpb.DutiesRequest, stream ethpb.BeaconNode
 
 	// If we are post-genesis time, then set the current epoch to
 	// the number epochs since the genesis time, otherwise 0 by default.
-	genesisTime := vs.GenesisTimeFetcher.GenesisTime()
-	var currentEpoch uint64
-	if genesisTime.Before(roughtime.Now()) {
-		currentEpoch = slotutil.EpochsSinceGenesis(vs.GenesisTimeFetcher.GenesisTime())
+	genesisTime := vs.TimeFetcher.GenesisTime()
+	if genesisTime.IsZero() {
+		return status.Error(codes.Unavailable, "genesis time is not set")
+	}
+	var currentEpoch types.Epoch
+	if genesisTime.Before(timeutils.Now()) {
+		currentEpoch = slotutil.EpochsSinceGenesis(vs.TimeFetcher.GenesisTime())
 	}
 	req.Epoch = currentEpoch
 	res, err := vs.duties(stream.Context(), req)
@@ -57,13 +61,13 @@ func (vs *Server) StreamDuties(req *ethpb.DutiesRequest, stream ethpb.BeaconNode
 	stateSub := vs.StateNotifier.StateFeed().Subscribe(stateChannel)
 	defer stateSub.Unsubscribe()
 
-	secondsPerEpoch := params.BeaconConfig().SecondsPerSlot * params.BeaconConfig().SlotsPerEpoch
-	epochTicker := slotutil.GetSlotTicker(vs.GenesisTimeFetcher.GenesisTime(), secondsPerEpoch)
+	secondsPerEpoch := params.BeaconConfig().SecondsPerSlot * uint64(params.BeaconConfig().SlotsPerEpoch)
+	epochTicker := slotutil.NewSlotTicker(vs.TimeFetcher.GenesisTime(), secondsPerEpoch)
 	for {
 		select {
 		// Ticks every epoch to submit assignments to connected validator clients.
-		case epoch := <-epochTicker.C():
-			req.Epoch = epoch
+		case slot := <-epochTicker.C():
+			req.Epoch = types.Epoch(slot)
 			res, err := vs.duties(stream.Context(), req)
 			if err != nil {
 				return status.Errorf(codes.Internal, "Could not compute validator duties: %v", err)
@@ -74,7 +78,7 @@ func (vs *Server) StreamDuties(req *ethpb.DutiesRequest, stream ethpb.BeaconNode
 		case ev := <-stateChannel:
 			// If a reorg occurred, we recompute duties for the connected validator clients
 			// and send another response over the server stream right away.
-			currentEpoch = slotutil.EpochsSinceGenesis(vs.GenesisTimeFetcher.GenesisTime())
+			currentEpoch = slotutil.EpochsSinceGenesis(vs.TimeFetcher.GenesisTime())
 			if ev.Type == statefeed.Reorg {
 				data, ok := ev.Data.(*statefeed.ReorgData)
 				if !ok {
@@ -107,13 +111,22 @@ func (vs *Server) StreamDuties(req *ethpb.DutiesRequest, stream ethpb.BeaconNode
 // Compute the validator duties from the head state's corresponding epoch
 // for validators public key / indices requested.
 func (vs *Server) duties(ctx context.Context, req *ethpb.DutiesRequest) (*ethpb.DutiesResponse, error) {
+	currentEpoch := helpers.SlotToEpoch(vs.TimeFetcher.CurrentSlot())
+	if req.Epoch > currentEpoch+1 {
+		return nil, status.Errorf(codes.Unavailable, "Request epoch %d can not be greater than next epoch %d", req.Epoch, currentEpoch+1)
+	}
+
 	s, err := vs.HeadFetcher.HeadState(ctx)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "Could not get head state: %v", err)
 	}
 
 	// Advance state with empty transitions up to the requested epoch start slot.
-	if epochStartSlot := helpers.StartSlot(req.Epoch); s.Slot() < epochStartSlot {
+	epochStartSlot, err := helpers.StartSlot(req.Epoch)
+	if err != nil {
+		return nil, err
+	}
+	if s.Slot() < epochStartSlot {
 		s, err = state.ProcessSlots(ctx, s, epochStartSlot)
 		if err != nil {
 			return nil, status.Errorf(codes.Internal, "Could not process slots up to %d: %v", epochStartSlot, err)
@@ -124,13 +137,11 @@ func (vs *Server) duties(ctx context.Context, req *ethpb.DutiesRequest) (*ethpb.
 		return nil, status.Errorf(codes.Internal, "Could not compute committee assignments: %v", err)
 	}
 	// Query the next epoch assignments for committee subnet subscriptions.
-	nextCommitteeAssignments, nextProposerIndexToSlots, err := helpers.CommitteeAssignments(s, req.Epoch+1)
+	nextCommitteeAssignments, _, err := helpers.CommitteeAssignments(s, req.Epoch+1)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "Could not compute next committee assignments: %v", err)
 	}
 
-	var committeeIDs []uint64
-	var nextCommitteeIDs []uint64
 	validatorAssignments := make([]*ethpb.DutiesResponse_Duty, 0, len(req.PublicKeys))
 	nextValidatorAssignments := make([]*ethpb.DutiesResponse_Duty, 0, len(req.PublicKeys))
 	for _, pubKey := range req.PublicKeys {
@@ -145,20 +156,21 @@ func (vs *Server) duties(ctx context.Context, req *ethpb.DutiesRequest) (*ethpb.
 		}
 		idx, ok := s.ValidatorIndexByPubkey(bytesutil.ToBytes48(pubKey))
 		if ok {
+			s := assignmentStatus(s, idx)
+
 			assignment.ValidatorIndex = idx
-			assignment.Status = assignmentStatus(s, idx)
+			assignment.Status = s
 			assignment.ProposerSlots = proposerIndexToSlots[idx]
 
+			// The next epoch has no lookup for proposer indexes.
 			nextAssignment.ValidatorIndex = idx
-			nextAssignment.Status = assignmentStatus(s, idx)
-			nextAssignment.ProposerSlots = nextProposerIndexToSlots[idx]
+			nextAssignment.Status = s
 
 			ca, ok := committeeAssignments[idx]
 			if ok {
 				assignment.Committee = ca.Committee
 				assignment.AttesterSlot = ca.AttesterSlot
 				assignment.CommitteeIndex = ca.CommitteeIndex
-				committeeIDs = append(committeeIDs, ca.CommitteeIndex)
 			}
 			// Save the next epoch assignments.
 			ca, ok = nextCommitteeAssignments[idx]
@@ -166,7 +178,6 @@ func (vs *Server) duties(ctx context.Context, req *ethpb.DutiesRequest) (*ethpb.
 				nextAssignment.Committee = ca.Committee
 				nextAssignment.AttesterSlot = ca.AttesterSlot
 				nextAssignment.CommitteeIndex = ca.CommitteeIndex
-				nextCommitteeIDs = append(nextCommitteeIDs, ca.CommitteeIndex)
 			}
 		} else {
 			// If the validator isn't in the beacon state, try finding their deposit to determine their status.
@@ -195,19 +206,19 @@ func assignValidatorToSubnet(pubkey []byte, status ethpb.ValidatorStatus) {
 	}
 
 	_, ok, expTime := cache.SubnetIDs.GetPersistentSubnets(pubkey)
-	if ok && expTime.After(roughtime.Now()) {
+	if ok && expTime.After(timeutils.Now()) {
 		return
 	}
-	epochDuration := time.Duration(params.BeaconConfig().SlotsPerEpoch * params.BeaconConfig().SecondsPerSlot)
-	assignedIdxs := []uint64{}
+	epochDuration := time.Duration(params.BeaconConfig().SlotsPerEpoch.Mul(params.BeaconConfig().SecondsPerSlot))
+	var assignedIdxs []uint64
 	randGen := rand.NewGenerator()
-	for i := uint64(0); i < params.BeaconNetworkConfig().RandomSubnetsPerValidator; i++ {
+	for i := uint64(0); i < params.BeaconConfig().RandomSubnetsPerValidator; i++ {
 		assignedIdx := randGen.Intn(int(params.BeaconNetworkConfig().AttestationSubnetCount))
 		assignedIdxs = append(assignedIdxs, uint64(assignedIdx))
 	}
 
-	assignedDuration := uint64(randGen.Intn(int(params.BeaconNetworkConfig().EpochsPerRandomSubnetSubscription)))
-	assignedDuration += params.BeaconNetworkConfig().EpochsPerRandomSubnetSubscription
+	assignedDuration := uint64(randGen.Intn(int(params.BeaconConfig().EpochsPerRandomSubnetSubscription)))
+	assignedDuration += params.BeaconConfig().EpochsPerRandomSubnetSubscription
 
 	totalDuration := epochDuration * time.Duration(assignedDuration)
 	cache.SubnetIDs.AddPersistentCommittee(pubkey, assignedIdxs, totalDuration*time.Second)

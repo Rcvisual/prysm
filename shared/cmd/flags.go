@@ -2,7 +2,9 @@
 package cmd
 
 import (
+	"github.com/prysmaticlabs/prysm/shared/params"
 	"github.com/urfave/cli/v2"
+	"github.com/urfave/cli/v2/altsrc"
 )
 
 var (
@@ -15,12 +17,6 @@ var (
 	E2EConfigFlag = &cli.BoolFlag{
 		Name:  "e2e-config",
 		Usage: "Use the E2E testing config, only for use within end-to-end testing.",
-	}
-	// CustomGenesisDelayFlag declares a genesis delay for use with handling the beacon chain start.
-	CustomGenesisDelayFlag = &cli.Uint64Flag{
-		Name: "custom-genesis-delay",
-		Usage: "Start the genesis event with the configured genesis delay in seconds. " +
-			"This flag should be used for local development and testing only.",
 	}
 	// RPCMaxPageSizeFlag defines the maximum numbers per page returned in RPC responses from this
 	// beacon node (default: 500).
@@ -39,6 +35,16 @@ var (
 		Name:  "datadir",
 		Usage: "Data directory for the databases and keystore",
 		Value: DefaultDataDir(),
+	}
+	// EnableBackupWebhookFlag for users to trigger db backups via an HTTP webhook.
+	EnableBackupWebhookFlag = &cli.BoolFlag{
+		Name:  "enable-db-backup-webhook",
+		Usage: "Serve HTTP handler to initiate database backups. The handler is served on the monitoring port at path /db/backup.",
+	}
+	// BackupWebhookOutputDir to customize the output directory for db backups.
+	BackupWebhookOutputDir = &cli.StringFlag{
+		Name:  "db-backup-output-dir",
+		Usage: "Output directory for db backups",
 	}
 	// EnableTracingFlag defines a flag to enable p2p message tracing.
 	EnableTracingFlag = &cli.BoolFlag{
@@ -89,7 +95,7 @@ var (
 	BootstrapNode = &cli.StringSliceFlag{
 		Name:  "bootstrap-node",
 		Usage: "The address of bootstrap node. Beacon node will connect for peer discovery via DHT.  Multiple nodes can be passed by using the flag multiple times but not comma-separated. You can also pass YAML files containing multiple nodes.",
-		Value: cli.NewStringSlice("enr:-Ku4QMKVC_MowDsmEa20d5uGjrChI0h8_KsKXDmgVQbIbngZV0idV6_RL7fEtZGo-kTNZ5o7_EJI_vCPJ6scrhwX0Z4Bh2F0dG5ldHOIAAAAAAAAAACEZXRoMpD1pf1CAAAAAP__________gmlkgnY0gmlwhBLf22SJc2VjcDI1NmsxoQJxCnE6v_x2ekgY_uoE1rtwzvGy40mq9eD66XfHPBWgIIN1ZHCCD6A"),
+		Value: cli.NewStringSlice(params.BeaconNetworkConfig().BootstrapNodes...),
 	}
 	// RelayNode tells the beacon node which relay node to connect to.
 	RelayNode = &cli.StringFlag{
@@ -141,7 +147,7 @@ var (
 		Value: "",
 	}
 	// P2PMaxPeers defines a flag to specify the max number of peers in libp2p.
-	P2PMaxPeers = &cli.Int64Flag{
+	P2PMaxPeers = &cli.IntFlag{
 		Name:  "p2p-max-peers",
 		Usage: "The max number of p2p peers to maintain.",
 		Value: 30,
@@ -173,11 +179,11 @@ var (
 	// LogFormat specifies the log output format.
 	LogFormat = &cli.StringFlag{
 		Name:  "log-format",
-		Usage: "Specify log formatting. Supports: text, json, fluentd.",
+		Usage: "Specify log formatting. Supports: text, json, fluentd, journald.",
 		Value: "text",
 	}
 	// MaxGoroutines specifies the maximum amount of goroutines tolerated, before a status check fails.
-	MaxGoroutines = &cli.Int64Flag{
+	MaxGoroutines = &cli.IntFlag{
 		Name:  "max-goroutines",
 		Usage: "Specifies the upper limit of goroutines running before a status check fails",
 		Value: 5000,
@@ -208,4 +214,37 @@ var (
 		Usage: "Integer to define max recieve message call size (default: 4194304 (for 4MB))",
 		Value: 1 << 22,
 	}
+	// AcceptTosFlag specifies user acceptance of ToS for non-interactive environments.
+	AcceptTosFlag = &cli.BoolFlag{
+		Name:  "accept-terms-of-use",
+		Usage: "Accept Terms and Conditions (for non-interactive environments)",
+	}
+	// RestoreSourceFileFlag specifies the filepath to the backed-up database file
+	// which will be used to restore the database.
+	RestoreSourceFileFlag = &cli.StringFlag{
+		Name:  "restore-source-file",
+		Usage: "Filepath to the backed-up database file which will be used to restore the database",
+	}
+	// RestoreTargetDirFlag specifies the target directory of the restored database.
+	RestoreTargetDirFlag = &cli.StringFlag{
+		Name:  "restore-target-dir",
+		Usage: "Target directory of the restored database",
+		Value: DefaultDataDir(),
+	}
+	// BoltMMapInitialSizeFlag specifies the initial size in bytes of boltdb's mmap syscall.
+	BoltMMapInitialSizeFlag = &cli.IntFlag{
+		Name:  "bolt-mmap-initial-size",
+		Usage: "Specifies the size in bytes of bolt db's mmap syscall allocation",
+		Value: 536870912, // 512 Mb as a default value.
+	}
 )
+
+// LoadFlagsFromConfig sets flags values from config file if ConfigFileFlag is set.
+func LoadFlagsFromConfig(cliCtx *cli.Context, flags []cli.Flag) error {
+	if cliCtx.IsSet(ConfigFileFlag.Name) {
+		if err := altsrc.InitInputSourceWithContext(flags, altsrc.NewYamlSourceFromFlagFunc(ConfigFileFlag.Name))(cliCtx); err != nil {
+			return err
+		}
+	}
+	return nil
+}

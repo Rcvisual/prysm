@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 
+	types "github.com/prysmaticlabs/eth2-types"
 	ethpb "github.com/prysmaticlabs/ethereumapis/eth/v1alpha1"
 	"github.com/prysmaticlabs/prysm/beacon-chain/core/helpers"
 	"github.com/prysmaticlabs/prysm/shared/bytesutil"
@@ -20,12 +21,15 @@ func (bs *Server) ListBeaconCommittees(
 	ctx context.Context,
 	req *ethpb.ListCommitteesRequest,
 ) (*ethpb.BeaconCommittees, error) {
-
 	currentSlot := bs.GenesisTimeFetcher.CurrentSlot()
-	var requestedSlot uint64
+	var requestedSlot types.Slot
 	switch q := req.QueryFilter.(type) {
 	case *ethpb.ListCommitteesRequest_Epoch:
-		requestedSlot = helpers.StartSlot(q.Epoch)
+		startSlot, err := helpers.StartSlot(q.Epoch)
+		if err != nil {
+			return nil, err
+		}
+		requestedSlot = startSlot
 	case *ethpb.ListCommitteesRequest_Genesis:
 		requestedSlot = 0
 	default:
@@ -55,19 +59,22 @@ func (bs *Server) ListBeaconCommittees(
 
 	return &ethpb.BeaconCommittees{
 		Epoch:                requestedEpoch,
-		Committees:           committees,
+		Committees:           committees.SlotToUint64(),
 		ActiveValidatorCount: uint64(len(activeIndices)),
 	}, nil
 }
 
 func (bs *Server) retrieveCommitteesForEpoch(
 	ctx context.Context,
-	epoch uint64,
-) (map[uint64]*ethpb.BeaconCommittees_CommitteesList, []uint64, error) {
-	startSlot := helpers.StartSlot(epoch)
+	epoch types.Epoch,
+) (SlotToCommiteesMap, []types.ValidatorIndex, error) {
+	startSlot, err := helpers.StartSlot(epoch)
+	if err != nil {
+		return nil, nil, err
+	}
 	requestedState, err := bs.StateGen.StateBySlot(ctx, startSlot)
 	if err != nil {
-		return nil, nil, status.Error(codes.Internal, "Could not get state")
+		return nil, nil, status.Errorf(codes.Internal, "Could not get state: %v", err)
 	}
 	seed, err := helpers.Seed(requestedState, epoch, params.BeaconConfig().DomainBeaconAttester)
 	if err != nil {
@@ -96,7 +103,7 @@ func (bs *Server) retrieveCommitteesForEpoch(
 func (bs *Server) retrieveCommitteesForRoot(
 	ctx context.Context,
 	root []byte,
-) (map[uint64]*ethpb.BeaconCommittees_CommitteesList, []uint64, error) {
+) (SlotToCommiteesMap, []types.ValidatorIndex, error) {
 	requestedState, err := bs.StateGen.StateByRoot(ctx, bytesutil.ToBytes32(root))
 	if err != nil {
 		return nil, nil, status.Error(codes.Internal, fmt.Sprintf("Could not get state: %v", err))
@@ -111,7 +118,10 @@ func (bs *Server) retrieveCommitteesForRoot(
 		return nil, nil, status.Error(codes.Internal, "Could not get active indices")
 	}
 
-	startSlot := helpers.StartSlot(epoch)
+	startSlot, err := helpers.StartSlot(epoch)
+	if err != nil {
+		return nil, nil, err
+	}
 	committeesListsBySlot, err := computeCommittees(startSlot, activeIndices, seed)
 	if err != nil {
 		return nil, nil, status.Errorf(
@@ -127,13 +137,13 @@ func (bs *Server) retrieveCommitteesForRoot(
 // Compute committees given a start slot, active validator indices, and
 // the attester seeds value.
 func computeCommittees(
-	startSlot uint64,
-	activeIndices []uint64,
+	startSlot types.Slot,
+	activeIndices []types.ValidatorIndex,
 	attesterSeed [32]byte,
-) (map[uint64]*ethpb.BeaconCommittees_CommitteesList, error) {
-	committeesListsBySlot := make(map[uint64]*ethpb.BeaconCommittees_CommitteesList)
+) (SlotToCommiteesMap, error) {
+	committeesListsBySlot := make(SlotToCommiteesMap, params.BeaconConfig().SlotsPerEpoch)
 	for slot := startSlot; slot < startSlot+params.BeaconConfig().SlotsPerEpoch; slot++ {
-		var countAtSlot = uint64(len(activeIndices)) / params.BeaconConfig().SlotsPerEpoch / params.BeaconConfig().TargetCommitteeSize
+		var countAtSlot = uint64(len(activeIndices)) / uint64(params.BeaconConfig().SlotsPerEpoch) / params.BeaconConfig().TargetCommitteeSize
 		if countAtSlot > params.BeaconConfig().MaxCommitteesPerSlot {
 			countAtSlot = params.BeaconConfig().MaxCommitteesPerSlot
 		}
@@ -142,7 +152,7 @@ func computeCommittees(
 		}
 		committeeItems := make([]*ethpb.BeaconCommittees_CommitteeItem, countAtSlot)
 		for committeeIndex := uint64(0); committeeIndex < countAtSlot; committeeIndex++ {
-			committee, err := helpers.BeaconCommittee(activeIndices, attesterSeed, slot, committeeIndex)
+			committee, err := helpers.BeaconCommittee(activeIndices, attesterSeed, slot, types.CommitteeIndex(committeeIndex))
 			if err != nil {
 				return nil, status.Errorf(
 					codes.Internal,
@@ -160,4 +170,17 @@ func computeCommittees(
 		}
 	}
 	return committeesListsBySlot, nil
+}
+
+// SlotToCommiteesMap represents <slot, CommitteeList> map.
+type SlotToCommiteesMap map[types.Slot]*ethpb.BeaconCommittees_CommitteesList
+
+// SlotToUint64 updates map keys to slots (workaround which will be unnecessary if we can cast
+// map<uint64, CommitteesList> correctly in beacon_chain.proto)
+func (m SlotToCommiteesMap) SlotToUint64() map[uint64]*ethpb.BeaconCommittees_CommitteesList {
+	updatedCommittees := make(map[uint64]*ethpb.BeaconCommittees_CommitteesList, len(m))
+	for k, v := range m {
+		updatedCommittees[uint64(k)] = v
+	}
+	return updatedCommittees
 }

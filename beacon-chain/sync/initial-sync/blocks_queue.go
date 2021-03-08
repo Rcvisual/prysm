@@ -5,10 +5,13 @@ import (
 	"errors"
 	"time"
 
+	"github.com/libp2p/go-libp2p-core/peer"
+	types "github.com/prysmaticlabs/eth2-types"
 	eth "github.com/prysmaticlabs/ethereumapis/eth/v1alpha1"
-	"github.com/prysmaticlabs/prysm/beacon-chain/blockchain"
 	"github.com/prysmaticlabs/prysm/beacon-chain/core/helpers"
+	"github.com/prysmaticlabs/prysm/beacon-chain/db"
 	"github.com/prysmaticlabs/prysm/beacon-chain/p2p"
+	beaconsync "github.com/prysmaticlabs/prysm/beacon-chain/sync"
 	"github.com/sirupsen/logrus"
 )
 
@@ -19,9 +22,24 @@ const (
 	pollingInterval = 200 * time.Millisecond
 	// staleEpochTimeout is an period after which epoch's state is considered stale.
 	staleEpochTimeout = 1 * time.Second
+	// skippedMachineTimeout is a period after which skipped machine is considered as stuck
+	// and is reset (if machine is the last one, then all machines are reset and search for
+	// skipped slot or backtracking takes place).
+	skippedMachineTimeout = 10 * staleEpochTimeout
 	// lookaheadSteps is a limit on how many forward steps are loaded into queue.
-	// Each step is managed by assigned finite state machine.
+	// Each step is managed by assigned finite state machine. Must be >= 2.
 	lookaheadSteps = 8
+	// noRequiredPeersErrMaxRetries defines number of retries when no required peers are found.
+	noRequiredPeersErrMaxRetries = 1000
+	// noRequiredPeersErrRefreshInterval defines interval for which queue will be paused before
+	// making the next attempt to obtain data.
+	noRequiredPeersErrRefreshInterval = 15 * time.Second
+	// maxResetAttempts number of times stale FSM is reset, before backtracking is triggered.
+	maxResetAttempts = 4
+	// startBackSlots defines number of slots before the current head, which defines a start position
+	// of the initial machine. This allows more robustness in case of normal sync sets head to some
+	// orphaned block: in that case starting earlier and re-fetching blocks allows to reorganize chain.
+	startBackSlots = 32
 )
 
 var (
@@ -29,15 +47,25 @@ var (
 	errQueueTakesTooLongToStop    = errors.New("queue takes too long to stop")
 	errInvalidInitialState        = errors.New("invalid initial state")
 	errInputNotFetchRequestParams = errors.New("input data is not type *fetchRequestParams")
+	errNoRequiredPeers            = errors.New("no peers with required blocks are found")
 )
+
+const (
+	modeStopOnFinalizedEpoch syncMode = iota
+	modeNonConstrained
+)
+
+// syncMode specifies sync mod type.
+type syncMode uint8
 
 // blocksQueueConfig is a config to setup block queue service.
 type blocksQueueConfig struct {
 	blocksFetcher       *blocksFetcher
-	headFetcher         blockchain.HeadFetcher
-	startSlot           uint64
-	highestExpectedSlot uint64
+	chain               blockchainService
+	highestExpectedSlot types.Slot
 	p2p                 p2p.P2P
+	db                  db.ReadOnlyDatabase
+	mode                syncMode
 }
 
 // blocksQueue is a priority queue that serves as a intermediary between block fetchers (producers)
@@ -47,10 +75,21 @@ type blocksQueue struct {
 	cancel              context.CancelFunc
 	smm                 *stateMachineManager
 	blocksFetcher       *blocksFetcher
-	headFetcher         blockchain.HeadFetcher
-	highestExpectedSlot uint64
-	fetchedBlocks       chan []*eth.SignedBeaconBlock // output channel for ready blocks
-	quit                chan struct{}                 // termination notifier
+	chain               blockchainService
+	highestExpectedSlot types.Slot
+	mode                syncMode
+	exitConditions      struct {
+		noRequiredPeersErrRetries int
+	}
+	fetchedData chan *blocksQueueFetchedData // output channel for ready blocks
+	staleEpochs map[types.Epoch]uint8        // counter to keep track of stale FSMs
+	quit        chan struct{}                // termination notifier
+}
+
+// blocksQueueFetchedData is a data container that is returned from a queue on each step.
+type blocksQueueFetchedData struct {
+	pid    peer.ID
+	blocks []*eth.SignedBeaconBlock
 }
 
 // newBlocksQueue creates initialized priority queue.
@@ -60,23 +99,33 @@ func newBlocksQueue(ctx context.Context, cfg *blocksQueueConfig) *blocksQueue {
 	blocksFetcher := cfg.blocksFetcher
 	if blocksFetcher == nil {
 		blocksFetcher = newBlocksFetcher(ctx, &blocksFetcherConfig{
-			headFetcher: cfg.headFetcher,
-			p2p:         cfg.p2p,
+			chain: cfg.chain,
+			p2p:   cfg.p2p,
+			db:    cfg.db,
 		})
 	}
 	highestExpectedSlot := cfg.highestExpectedSlot
-	if highestExpectedSlot <= cfg.startSlot {
-		highestExpectedSlot = blocksFetcher.bestFinalizedSlot()
+	if highestExpectedSlot == 0 {
+		if cfg.mode == modeStopOnFinalizedEpoch {
+			highestExpectedSlot = blocksFetcher.bestFinalizedSlot()
+		} else {
+			highestExpectedSlot = blocksFetcher.bestNonFinalizedSlot()
+		}
 	}
+
+	// Override fetcher's sync mode.
+	blocksFetcher.mode = cfg.mode
 
 	queue := &blocksQueue{
 		ctx:                 ctx,
 		cancel:              cancel,
 		highestExpectedSlot: highestExpectedSlot,
 		blocksFetcher:       blocksFetcher,
-		headFetcher:         cfg.headFetcher,
-		fetchedBlocks:       make(chan []*eth.SignedBeaconBlock, 1),
+		chain:               cfg.chain,
+		mode:                cfg.mode,
+		fetchedData:         make(chan *blocksQueueFetchedData, 1),
 		quit:                make(chan struct{}),
+		staleEpochs:         make(map[types.Epoch]uint8),
 	}
 
 	// Configure state machines.
@@ -118,7 +167,7 @@ func (q *blocksQueue) loop() {
 
 	defer func() {
 		q.blocksFetcher.stop()
-		close(q.fetchedBlocks)
+		close(q.fetchedData)
 	}()
 
 	if err := q.blocksFetcher.start(); err != nil {
@@ -126,24 +175,42 @@ func (q *blocksQueue) loop() {
 	}
 
 	// Define initial state machines.
-	startSlot := q.headFetcher.HeadSlot()
+	startSlot := q.chain.HeadSlot()
+	if startSlot > startBackSlots {
+		startSlot -= startBackSlots
+	}
 	blocksPerRequest := q.blocksFetcher.blocksPerSecond
-	for i := startSlot; i < startSlot+blocksPerRequest*lookaheadSteps; i += blocksPerRequest {
+	for i := startSlot; i < startSlot.Add(blocksPerRequest*lookaheadSteps); i += types.Slot(blocksPerRequest) {
 		q.smm.addStateMachine(i)
 	}
 
 	ticker := time.NewTicker(pollingInterval)
+	defer ticker.Stop()
 	for {
 		// Check highest expected slot when we approach chain's head slot.
-		if q.headFetcher.HeadSlot() >= q.highestExpectedSlot {
+		if q.chain.HeadSlot() >= q.highestExpectedSlot {
 			// By the time initial sync is complete, highest slot may increase, re-check.
-			if q.highestExpectedSlot < q.blocksFetcher.bestFinalizedSlot() {
-				q.highestExpectedSlot = q.blocksFetcher.bestFinalizedSlot()
-				continue
+			if q.mode == modeStopOnFinalizedEpoch {
+				if q.highestExpectedSlot < q.blocksFetcher.bestFinalizedSlot() {
+					q.highestExpectedSlot = q.blocksFetcher.bestFinalizedSlot()
+					continue
+				}
+			} else {
+				if q.highestExpectedSlot < q.blocksFetcher.bestNonFinalizedSlot() {
+					q.highestExpectedSlot = q.blocksFetcher.bestNonFinalizedSlot()
+					continue
+				}
 			}
 			log.WithField("slot", q.highestExpectedSlot).Debug("Highest expected slot reached")
 			q.cancel()
 		}
+
+		log.WithFields(logrus.Fields{
+			"highestExpectedSlot": q.highestExpectedSlot,
+			"headSlot":            q.chain.HeadSlot(),
+			"state":               q.smm.String(),
+			"staleEpoch":          q.staleEpochs,
+		}).Trace("tick")
 
 		select {
 		case <-ticker.C:
@@ -151,15 +218,28 @@ func (q *blocksQueue) loop() {
 				fsm := q.smm.machines[key]
 				if err := fsm.trigger(eventTick, nil); err != nil {
 					log.WithFields(logrus.Fields{
-						"event": eventTick,
-						"epoch": helpers.SlotToEpoch(fsm.start),
-						"start": fsm.start,
-						"error": err.Error(),
+						"highestExpectedSlot":       q.highestExpectedSlot,
+						"noRequiredPeersErrRetries": q.exitConditions.noRequiredPeersErrRetries,
+						"event":                     eventTick,
+						"epoch":                     helpers.SlotToEpoch(fsm.start),
+						"start":                     fsm.start,
+						"error":                     err.Error(),
 					}).Debug("Can not trigger event")
+					if errors.Is(err, errNoRequiredPeers) {
+						forceExit := q.exitConditions.noRequiredPeersErrRetries > noRequiredPeersErrMaxRetries
+						if q.mode == modeStopOnFinalizedEpoch || forceExit {
+							q.cancel()
+						} else {
+							q.exitConditions.noRequiredPeersErrRetries++
+							log.Debug("Waiting for finalized peers")
+							time.Sleep(noRequiredPeersErrRefreshInterval)
+						}
+						continue
+					}
 				}
 				// Do garbage collection, and advance sliding window forward.
-				if q.headFetcher.HeadSlot() >= fsm.start+blocksPerRequest-1 {
-					highestStartBlock, err := q.smm.highestStartBlock()
+				if q.chain.HeadSlot() >= fsm.start.Add(blocksPerRequest-1) {
+					highestStartSlot, err := q.smm.highestStartSlot()
 					if err != nil {
 						log.WithError(err).Debug("Cannot obtain highest epoch state number")
 						continue
@@ -168,7 +248,7 @@ func (q *blocksQueue) loop() {
 						log.WithError(err).Debug("Can not remove state machine")
 					}
 					if len(q.smm.machines) < lookaheadSteps {
-						q.smm.addStateMachine(highestStartBlock + blocksPerRequest)
+						q.smm.addStateMachine(highestStartSlot.Add(blocksPerRequest))
 					}
 				}
 			}
@@ -192,7 +272,6 @@ func (q *blocksQueue) loop() {
 			}
 		case <-q.ctx.Done():
 			log.Debug("Context closed, exiting goroutine (blocks queue)")
-			ticker.Stop()
 			return
 		}
 	}
@@ -227,19 +306,25 @@ func (q *blocksQueue) onDataReceivedEvent(ctx context.Context) eventHandlerFn {
 		}
 		response, ok := in.(*fetchRequestResponse)
 		if !ok {
-			return 0, errInputNotFetchRequestParams
+			return m.state, errInputNotFetchRequestParams
 		}
 		if response.err != nil {
-			// Current window is already too big, re-request previous epochs.
-			if response.err == errSlotIsTooHigh {
+			switch response.err {
+			case errSlotIsTooHigh:
+				// Current window is already too big, re-request previous epochs.
 				for _, fsm := range q.smm.machines {
 					if fsm.start < response.start && fsm.state == stateSkipped {
 						fsm.setState(stateNew)
 					}
 				}
+			case beaconsync.ErrInvalidFetchedData:
+				// Peer returned invalid data, penalize.
+				q.blocksFetcher.p2p.Peers().Scorers().BadResponsesScorer().Increment(m.pid)
+				log.WithField("pid", response.pid).Debug("Peer is penalized for invalid blocks")
 			}
 			return m.state, response.err
 		}
+		m.pid = response.pid
 		m.blocks = response.blocks
 		return stateDataParsed, nil
 	}
@@ -260,10 +345,14 @@ func (q *blocksQueue) onReadyToSendEvent(ctx context.Context) eventHandlerFn {
 		}
 
 		send := func() (stateID, error) {
+			data := &blocksQueueFetchedData{
+				pid:    m.pid,
+				blocks: m.blocks,
+			}
 			select {
 			case <-ctx.Done():
 				return m.state, ctx.Err()
-			case q.fetchedBlocks <- m.blocks:
+			case q.fetchedData <- data:
 			}
 			return stateSent, nil
 		}
@@ -303,7 +392,7 @@ func (q *blocksQueue) onProcessSkippedEvent(ctx context.Context) eventHandlerFn 
 		// Only the highest epoch with skipped state can trigger extension.
 		if !m.isLast() {
 			// When a state machine stays in skipped state for too long - reset it.
-			if time.Since(m.updated) > 5*staleEpochTimeout {
+			if time.Since(m.updated) > skippedMachineTimeout {
 				return stateNew, nil
 			}
 			return m.state, nil
@@ -315,30 +404,36 @@ func (q *blocksQueue) onProcessSkippedEvent(ctx context.Context) eventHandlerFn 
 			return m.state, nil
 		}
 
-		// Shift start position of all the machines except for the last one.
-		startSlot := q.headFetcher.HeadSlot() + 1
-		blocksPerRequest := q.blocksFetcher.blocksPerSecond
-		if err := q.smm.removeAllStateMachines(); err != nil {
-			return stateSkipped, err
-		}
-		for i := startSlot; i < startSlot+blocksPerRequest*(lookaheadSteps-1); i += blocksPerRequest {
-			q.smm.addStateMachine(i)
+		// Check if we have enough peers to progress, or sync needs to halt (due to no peers available).
+		bestFinalizedSlot := q.blocksFetcher.bestFinalizedSlot()
+		if q.mode == modeStopOnFinalizedEpoch {
+			if bestFinalizedSlot <= q.chain.HeadSlot() {
+				return stateSkipped, errNoRequiredPeers
+			}
+		} else {
+			if q.blocksFetcher.bestNonFinalizedSlot() <= q.chain.HeadSlot() {
+				return stateSkipped, errNoRequiredPeers
+			}
 		}
 
-		// Replace the last (currently activated) state machine.
-		nonSkippedSlot, err := q.blocksFetcher.nonSkippedSlotAfter(
-			ctx, startSlot+blocksPerRequest*(lookaheadSteps-1)-1)
-		if err != nil {
-			return stateSkipped, err
+		// All machines are skipped, FSMs need reset.
+		startSlot := q.chain.HeadSlot() + 1
+		if q.mode == modeNonConstrained && startSlot > bestFinalizedSlot {
+			q.staleEpochs[helpers.SlotToEpoch(startSlot)]++
+			// If FSMs have been reset enough times, try to explore alternative forks.
+			if q.staleEpochs[helpers.SlotToEpoch(startSlot)] >= maxResetAttempts {
+				delete(q.staleEpochs, helpers.SlotToEpoch(startSlot))
+				fork, err := q.blocksFetcher.findFork(ctx, startSlot)
+				if err == nil {
+					return stateSkipped, q.resetFromFork(ctx, fork)
+				}
+				log.WithFields(logrus.Fields{
+					"epoch": helpers.SlotToEpoch(startSlot),
+					"error": err.Error(),
+				}).Debug("Can not explore alternative branches")
+			}
 		}
-		if q.highestExpectedSlot < q.blocksFetcher.bestFinalizedSlot() {
-			q.highestExpectedSlot = q.blocksFetcher.bestFinalizedSlot()
-		}
-		if nonSkippedSlot > q.highestExpectedSlot {
-			nonSkippedSlot = startSlot + blocksPerRequest*(lookaheadSteps-1)
-		}
-		q.smm.addStateMachine(nonSkippedSlot)
-		return stateSkipped, nil
+		return stateSkipped, q.resetFromSlot(ctx, startSlot)
 	}
 }
 

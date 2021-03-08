@@ -17,18 +17,15 @@ import (
 	"github.com/prysmaticlabs/prysm/shared/params"
 )
 
-// StartBeaconNodes starts the requested amount of beacon nodes, passing in the deposit contract given.
-func StartBeaconNodes(t *testing.T, config *types.E2EConfig, enr string) []int {
-	var processIDs []int
+// StartBeaconNodes starts the requested amount of beacon nodes.
+func StartBeaconNodes(t *testing.T, config *types.E2EConfig, enr string) {
 	for i := 0; i < e2e.TestParams.BeaconNodeCount; i++ {
-		pID := StartNewBeaconNode(t, config, i, enr)
-		processIDs = append(processIDs, pID)
+		StartNewBeaconNode(t, config, i, enr)
 	}
-	return processIDs
 }
 
 // StartNewBeaconNode starts a fresh beacon node, connecting to all passed in beacon nodes.
-func StartNewBeaconNode(t *testing.T, config *types.E2EConfig, index int, enr string) int {
+func StartNewBeaconNode(t *testing.T, config *types.E2EConfig, index int, enr string) {
 	binaryPath, found := bazel.FindBinary("beacon-chain", "beacon-chain")
 	if !found {
 		t.Log(binaryPath)
@@ -54,28 +51,30 @@ func StartNewBeaconNode(t *testing.T, config *types.E2EConfig, index int, enr st
 		fmt.Sprintf("--contract-deployment-block=%d", 0),
 		fmt.Sprintf("--rpc-max-page-size=%d", params.BeaconConfig().MinGenesisActiveValidatorCount),
 		fmt.Sprintf("--bootstrap-node=%s", enr),
-		"--verbosity=trace",
+		"--verbosity=debug",
 		"--force-clear-db",
 		"--e2e-config",
+		"--accept-terms-of-use",
+	}
+	if config.UsePprof {
+		args = append(args, "--pprof", fmt.Sprintf("--pprofport=%d", e2e.TestParams.BeaconNodeRPCPort+index+50))
 	}
 	args = append(args, featureconfig.E2EBeaconChainFlags...)
 	args = append(args, config.BeaconFlags...)
 
 	cmd := exec.Command(binaryPath, args...)
 	t.Logf("Starting beacon chain %d with flags: %s", index, strings.Join(args[2:], " "))
-	if err := cmd.Start(); err != nil {
+	if err = cmd.Start(); err != nil {
 		t.Fatalf("Failed to start beacon node: %v", err)
 	}
 
-	if err = helpers.WaitForTextInFile(stdOutFile, "RPC-API listening on port"); err != nil {
+	if err = helpers.WaitForTextInFile(stdOutFile, "gRPC server listening on port"); err != nil {
 		t.Fatalf("could not find multiaddr for node %d, this means the node had issues starting: %v", index, err)
 	}
-
-	return cmd.Process.Pid
 }
 
-// StartBootnode starts a bootnode and returns its ENR and process ID.
-func StartBootnode(t *testing.T) (string, int) {
+// StartBootnode starts a bootnode and returns its ENR.
+func StartBootnode(t *testing.T) string {
 	binaryPath, found := bazel.FindBinary("tools/bootnode", "bootnode")
 	if !found {
 		t.Log(binaryPath)
@@ -98,7 +97,7 @@ func StartBootnode(t *testing.T) (string, int) {
 	cmd.Stdout = stdOutFile
 	cmd.Stderr = stdOutFile
 	t.Logf("Starting boot node with flags: %s", strings.Join(args[1:], " "))
-	if err := cmd.Start(); err != nil {
+	if err = cmd.Start(); err != nil {
 		t.Fatalf("Failed to start beacon node: %v", err)
 	}
 
@@ -106,15 +105,15 @@ func StartBootnode(t *testing.T) (string, int) {
 		t.Fatalf("could not find enr for bootnode, this means the bootnode had issues starting: %v", err)
 	}
 
-	enr, err := getENRFromLogFile(stdOutFile.Name())
+	enr, err := enrFromLogFile(stdOutFile.Name())
 	if err != nil {
 		t.Fatalf("could not get enr for bootnode: %v", err)
 	}
 
-	return enr, cmd.Process.Pid
+	return enr
 }
 
-func getENRFromLogFile(name string) (string, error) {
+func enrFromLogFile(name string) (string, error) {
 	byteContent, err := ioutil.ReadFile(name)
 	if err != nil {
 		return "", err

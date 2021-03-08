@@ -29,3 +29,10 @@ password.txt
 
 # Dist files
 dist
+
+# libfuzzer
+oom-*
+crash-*
+
+# deepsource cli
+bin

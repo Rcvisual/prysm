@@ -5,6 +5,10 @@ import (
 	"encoding/binary"
 	"errors"
 	"math/bits"
+	"regexp"
+
+	"github.com/ethereum/go-ethereum/common/hexutil"
+	types "github.com/prysmaticlabs/eth2-types"
 )
 
 // ToBytes returns integer x to bytes in little-endian format at the specified length.
@@ -56,7 +60,7 @@ func Bytes8(x uint64) []byte {
 	return bytes
 }
 
-// Bytes32 returns integer x to bytes in little-endian format, x.to_bytes(8, 'little').
+// Bytes32 returns integer x to bytes in little-endian format, x.to_bytes(32, 'little').
 func Bytes32(x uint64) []byte {
 	bytes := make([]byte, 32)
 	binary.LittleEndian.PutUint64(bytes, x)
@@ -85,29 +89,11 @@ func ToBytes4(x []byte) [4]byte {
 	return y
 }
 
-// ToBytes8 is a convenience method for converting a byte slice to a fix
-// sized 8 byte array. This method will truncate the input if it is larger
-// than 8 bytes.
-func ToBytes8(x []byte) [8]byte {
-	var y [8]byte
-	copy(y[:], x)
-	return y
-}
-
 // ToBytes32 is a convenience method for converting a byte slice to a fix
 // sized 32 byte array. This method will truncate the input if it is larger
 // than 32 bytes.
 func ToBytes32(x []byte) [32]byte {
 	var y [32]byte
-	copy(y[:], x)
-	return y
-}
-
-// ToBytes96 is a convenience method for converting a byte slice to a fix
-// sized 96 byte array. This method will truncate the input if it is larger
-// than 96 bytes.
-func ToBytes96(x []byte) [96]byte {
-	var y [96]byte
 	copy(y[:], x)
 	return y
 }
@@ -149,12 +135,6 @@ func FromBool(x bool) byte {
 		return 1
 	}
 	return 0
-}
-
-// FromBytes32 is a convenience method for converting a fixed-size byte array
-// to a byte slice.
-func FromBytes32(x [32]byte) []byte {
-	return x[:]
 }
 
 // FromBytes48 is a convenience method for converting a fixed-size byte array
@@ -264,7 +244,7 @@ func MakeEmptyBitlists(i int) []byte {
 // HighestBitIndex returns the index of the highest
 // bit set from bitlist `b`.
 func HighestBitIndex(b []byte) (int, error) {
-	if b == nil || len(b) == 0 {
+	if len(b) == 0 {
 		return 0, errors.New("input list can't be empty or nil")
 	}
 
@@ -308,9 +288,58 @@ func HighestBitIndexAt(b []byte, index int) (int, error) {
 	return 0, nil
 }
 
-// Uint64ToBytes little endian conversion.
-func Uint64ToBytes(i uint64) []byte {
+// Uint64ToBytesLittleEndian conversion.
+func Uint64ToBytesLittleEndian(i uint64) []byte {
 	buf := make([]byte, 8)
 	binary.LittleEndian.PutUint64(buf, i)
 	return buf
+}
+
+// Uint64ToBytesBigEndian conversion.
+func Uint64ToBytesBigEndian(i uint64) []byte {
+	buf := make([]byte, 8)
+	binary.BigEndian.PutUint64(buf, i)
+	return buf
+}
+
+// BytesToUint64BigEndian conversion. Returns 0 if empty bytes or byte slice with length less
+// than 8.
+func BytesToUint64BigEndian(b []byte) uint64 {
+	if len(b) < 8 { // This will panic otherwise.
+		return 0
+	}
+	return binary.BigEndian.Uint64(b)
+}
+
+// EpochToBytesLittleEndian conversion.
+func EpochToBytesLittleEndian(i types.Epoch) []byte {
+	return Uint64ToBytesLittleEndian(uint64(i))
+}
+
+// EpochToBytesBigEndian conversion.
+func EpochToBytesBigEndian(i types.Epoch) []byte {
+	return Uint64ToBytesBigEndian(uint64(i))
+}
+
+// BytesToEpochBigEndian conversion.
+func BytesToEpochBigEndian(b []byte) types.Epoch {
+	return types.Epoch(BytesToUint64BigEndian(b))
+}
+
+// SlotToBytesBigEndian conversion.
+func SlotToBytesBigEndian(i types.Slot) []byte {
+	return Uint64ToBytesBigEndian(uint64(i))
+}
+
+// BytesToSlotBigEndian conversion.
+func BytesToSlotBigEndian(b []byte) types.Slot {
+	return types.Slot(BytesToUint64BigEndian(b))
+}
+
+// IsBytes32Hex checks whether the byte array is a 32-byte long hex number.
+func IsBytes32Hex(b []byte) (bool, error) {
+	if b == nil {
+		return false, nil
+	}
+	return regexp.Match("^0x[0-9a-fA-F]{64}$", []byte(hexutil.Encode(b)))
 }

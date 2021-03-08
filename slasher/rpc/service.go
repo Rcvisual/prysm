@@ -17,7 +17,6 @@ import (
 	"github.com/prysmaticlabs/prysm/slasher/beaconclient"
 	"github.com/prysmaticlabs/prysm/slasher/db"
 	"github.com/prysmaticlabs/prysm/slasher/detection"
-	"github.com/sirupsen/logrus"
 	"go.opencensus.io/plugin/ocgrpc"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
@@ -52,8 +51,6 @@ type Config struct {
 	BeaconClient *beaconclient.Service
 }
 
-var log = logrus.WithField("prefix", "rpc")
-
 // NewService instantiates a new RPC service instance that will
 // be registered into a running beacon node.
 func NewService(ctx context.Context, cfg *Config) *Service {
@@ -79,7 +76,7 @@ func (s *Service) Start() {
 		log.Errorf("Could not listen to port in Start() %s: %v", address, err)
 	}
 	s.listener = lis
-	log.WithField("address", address).Info("RPC-API listening on port")
+	log.WithField("address", address).Info("gRPC server listening on port")
 
 	opts := []grpc.ServerOption{
 		grpc.StatsHandler(&ocgrpc.ServerHandler{}),
@@ -146,10 +143,14 @@ func (s *Service) Stop() error {
 	return nil
 }
 
-// Status returns nil or credentialError
+// Status returns nil if slasher is ready to receive attestations and
+// blocks from clients for slashing detection.
 func (s *Service) Status() error {
 	if s.credentialError != nil {
 		return s.credentialError
 	}
-	return nil
+	if bs := s.beaconclient.Status(); bs != nil {
+		return bs
+	}
+	return s.detector.Status()
 }

@@ -1,6 +1,7 @@
 package sync
 
 import (
+	"strings"
 	"time"
 
 	"github.com/libp2p/go-libp2p-core/network"
@@ -26,12 +27,13 @@ func SetRPCStreamDeadlines(stream network.Stream) {
 // issues being able to properly close streams, leading to unexpected failures and possible
 // memory leaks.
 func SetStreamReadDeadline(stream network.Stream, duration time.Duration) {
-	if err := stream.SetReadDeadline(time.Now().Add(duration)); err != nil {
+	if err := stream.SetReadDeadline(time.Now().Add(duration)); err != nil &&
+		!strings.Contains(err.Error(), "stream closed") {
 		log.WithError(err).WithFields(logrus.Fields{
 			"peer":      stream.Conn().RemotePeer(),
 			"protocol":  stream.Protocol(),
 			"direction": stream.Stat().Direction,
-		}).Debug("Failed to set stream deadline")
+		}).Debug("Could not set stream deadline")
 	}
 }
 
@@ -49,6 +51,6 @@ func SetStreamWriteDeadline(stream network.Stream, duration time.Duration) {
 			"peer":      stream.Conn().RemotePeer(),
 			"protocol":  stream.Protocol(),
 			"direction": stream.Stat().Direction,
-		}).Debug("Failed to set stream deadline")
+		}).Debug("Could not set stream deadline")
 	}
 }

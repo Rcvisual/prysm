@@ -4,6 +4,7 @@ import (
 	"context"
 	"strconv"
 
+	types "github.com/prysmaticlabs/eth2-types"
 	ethpb "github.com/prysmaticlabs/ethereumapis/eth/v1alpha1"
 	"github.com/prysmaticlabs/prysm/beacon-chain/core/helpers"
 	"github.com/prysmaticlabs/prysm/shared/bytesutil"
@@ -28,9 +29,9 @@ func (bs *Server) ListValidatorAssignments(
 	}
 
 	var res []*ethpb.ValidatorAssignments_CommitteeAssignment
-	filtered := map[uint64]bool{} // track filtered validators to prevent duplication in the response.
-	filteredIndices := make([]uint64, 0)
-	var requestedEpoch uint64
+	filtered := map[types.ValidatorIndex]bool{} // track filtered validators to prevent duplication in the response.
+	filteredIndices := make([]types.ValidatorIndex, 0)
+	var requestedEpoch types.Epoch
 	switch q := req.QueryFilter.(type) {
 	case *ethpb.ListValidatorAssignmentsRequest_Genesis:
 		if q.Genesis {
@@ -50,7 +51,11 @@ func (bs *Server) ListValidatorAssignments(
 		)
 	}
 
-	requestedState, err := bs.StateGen.StateBySlot(ctx, helpers.StartSlot(requestedEpoch))
+	startSlot, err := helpers.StartSlot(requestedEpoch)
+	if err != nil {
+		return nil, err
+	}
+	requestedState, err := bs.StateGen.StateBySlot(ctx, startSlot)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "Could not retrieve archived state for epoch %d: %v", requestedEpoch, err)
 	}
@@ -94,15 +99,13 @@ func (bs *Server) ListValidatorAssignments(
 	}
 
 	// Initialize all committee related data.
-	committeeAssignments := map[uint64]*helpers.CommitteeAssignmentContainer{}
-	proposerIndexToSlots := make(map[uint64][]uint64)
-	committeeAssignments, proposerIndexToSlots, err = helpers.CommitteeAssignments(requestedState, requestedEpoch)
+	committeeAssignments, proposerIndexToSlots, err := helpers.CommitteeAssignments(requestedState, requestedEpoch)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "Could not compute committee assignments: %v", err)
 	}
 
 	for _, index := range filteredIndices[start:end] {
-		if index >= uint64(requestedState.NumValidators()) {
+		if uint64(index) >= uint64(requestedState.NumValidators()) {
 			return nil, status.Errorf(codes.OutOfRange, "Validator index %d >= validator count %d",
 				index, requestedState.NumValidators())
 		}

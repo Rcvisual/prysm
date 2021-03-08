@@ -6,10 +6,10 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"reflect"
 	"sort"
 
 	"github.com/pkg/errors"
+	types "github.com/prysmaticlabs/eth2-types"
 	ethpb "github.com/prysmaticlabs/ethereumapis/eth/v1alpha1"
 	"github.com/prysmaticlabs/go-bitfield"
 	"github.com/prysmaticlabs/prysm/beacon-chain/core/helpers"
@@ -36,11 +36,14 @@ import (
 //        data=attestation.data,
 //        signature=attestation.signature,
 //    )
-func ConvertToIndexed(ctx context.Context, attestation *ethpb.Attestation, committee []uint64) *ethpb.IndexedAttestation {
+func ConvertToIndexed(ctx context.Context, attestation *ethpb.Attestation, committee []types.ValidatorIndex) (*ethpb.IndexedAttestation, error) {
 	ctx, span := trace.StartSpan(ctx, "attestationutil.ConvertToIndexed")
 	defer span.End()
 
-	attIndices := AttestingIndices(attestation.AggregationBits, committee)
+	attIndices, err := AttestingIndices(attestation.AggregationBits, committee)
+	if err != nil {
+		return nil, err
+	}
 
 	sort.Slice(attIndices, func(i, j int) bool {
 		return attIndices[i] < attIndices[j]
@@ -50,11 +53,11 @@ func ConvertToIndexed(ctx context.Context, attestation *ethpb.Attestation, commi
 		Signature:        attestation.Signature,
 		AttestingIndices: attIndices,
 	}
-	return inAtt
+	return inAtt, err
 }
 
 // AttestingIndices returns the attesting participants indices from the attestation data. The
-// committee is provided as an argument rather than a direct implementation from the spec definition.
+// committee is provided as an argument rather than a imported implementation from the spec definition.
 // Having the committee as an argument allows for re-use of beacon committees when possible.
 //
 // Spec pseudocode definition:
@@ -66,14 +69,17 @@ func ConvertToIndexed(ctx context.Context, attestation *ethpb.Attestation, commi
 //    """
 //    committee = get_beacon_committee(state, data.slot, data.index)
 //    return set(index for i, index in enumerate(committee) if bits[i])
-func AttestingIndices(bf bitfield.Bitfield, committee []uint64) []uint64 {
-	indices := make([]uint64, 0, len(committee))
+func AttestingIndices(bf bitfield.Bitfield, committee []types.ValidatorIndex) ([]uint64, error) {
+	if bf.Len() != uint64(len(committee)) {
+		return nil, fmt.Errorf("bitfield length %d is not equal to committee length %d", bf.Len(), len(committee))
+	}
+	indices := make([]uint64, 0, bf.Count())
 	for _, idx := range bf.BitIndices() {
 		if idx < len(committee) {
-			indices = append(indices, committee[idx])
+			indices = append(indices, uint64(committee[idx]))
 		}
 	}
-	return indices
+	return indices, nil
 }
 
 // VerifyIndexedAttestationSig this helper function performs the last part of the
@@ -144,7 +150,7 @@ func IsValidAttestationIndices(ctx context.Context, indexedAttestation *ethpb.In
 	ctx, span := trace.StartSpan(ctx, "attestationutil.IsValidAttestationIndices")
 	defer span.End()
 
-	if indexedAttestation == nil || indexedAttestation.Data == nil || indexedAttestation.Data.Target == nil {
+	if indexedAttestation == nil || indexedAttestation.Data == nil || indexedAttestation.Data.Target == nil || indexedAttestation.AttestingIndices == nil {
 		return errors.New("nil or missing indexed attestation data")
 	}
 	indices := indexedAttestation.AttestingIndices
@@ -154,26 +160,16 @@ func IsValidAttestationIndices(ctx context.Context, indexedAttestation *ethpb.In
 	if uint64(len(indices)) > params.BeaconConfig().MaxValidatorsPerCommittee {
 		return fmt.Errorf("validator indices count exceeds MAX_VALIDATORS_PER_COMMITTEE, %d > %d", len(indices), params.BeaconConfig().MaxValidatorsPerCommittee)
 	}
-	set := make(map[uint64]bool)
-	setIndices := make([]uint64, 0, len(indices))
-	for _, i := range indices {
-		if ok := set[i]; ok {
-			continue
+	for i := 1; i < len(indices); i++ {
+		if indices[i-1] >= indices[i] {
+			return errors.New("attesting indices is not uniquely sorted")
 		}
-		setIndices = append(setIndices, i)
-		set[i] = true
-	}
-	sort.SliceStable(setIndices, func(i, j int) bool {
-		return setIndices[i] < setIndices[j]
-	})
-	if !reflect.DeepEqual(setIndices, indices) {
-		return errors.New("attesting indices is not uniquely sorted")
 	}
 	return nil
 }
 
 // AttDataIsEqual this function performs an equality check between 2 attestation data, if they're unequal, it will return false.
-func AttDataIsEqual(attData1 *ethpb.AttestationData, attData2 *ethpb.AttestationData) bool {
+func AttDataIsEqual(attData1, attData2 *ethpb.AttestationData) bool {
 	if attData1.Slot != attData2.Slot {
 		return false
 	}
@@ -199,7 +195,7 @@ func AttDataIsEqual(attData1 *ethpb.AttestationData, attData2 *ethpb.Attestation
 }
 
 // CheckPointIsEqual performs an equality check between 2 check points, returns false if unequal.
-func CheckPointIsEqual(checkPt1 *ethpb.Checkpoint, checkPt2 *ethpb.Checkpoint) bool {
+func CheckPointIsEqual(checkPt1, checkPt2 *ethpb.Checkpoint) bool {
 	if checkPt1.Epoch != checkPt2.Epoch {
 		return false
 	}

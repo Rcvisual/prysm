@@ -6,21 +6,20 @@ import (
 	"bytes"
 	"context"
 
+	fssz "github.com/ferranbt/fastssz"
 	"github.com/golang/protobuf/jsonpb"
 	"github.com/golang/protobuf/proto"
 	eth "github.com/prysmaticlabs/ethereumapis/eth/v1alpha1"
-	"github.com/prysmaticlabs/go-ssz"
 	"github.com/prysmaticlabs/prysm/beacon-chain/db/iface"
 	"github.com/prysmaticlabs/prysm/shared/featureconfig"
 	"github.com/prysmaticlabs/prysm/shared/traceutil"
-	"github.com/sirupsen/logrus"
 	"go.opencensus.io/trace"
 	"gopkg.in/confluentinc/confluent-kafka-go.v1/kafka"
 	_ "gopkg.in/confluentinc/confluent-kafka-go.v1/kafka/librdkafka" // Required for c++ kafka library.
+	"gopkg.in/errgo.v2/fmt/errors"
 )
 
-var _ = iface.Database(&Exporter{})
-var log = logrus.WithField("prefix", "exporter")
+var _ iface.Database = (*Exporter)(nil)
 var marshaler = &jsonpb.Marshaler{}
 
 // Exporter wraps a database interface and exports certain objects to kafka topics.
@@ -55,7 +54,13 @@ func (e Exporter) publish(ctx context.Context, topic string, msg proto.Message) 
 		return err
 	}
 
-	key, err := ssz.HashTreeRoot(msg)
+	var key [32]byte
+	var err error
+	if v, ok := msg.(fssz.HashRoot); ok {
+		key, err = v.HashTreeRoot()
+	} else {
+		err = errors.New("object does not follow hash tree root interface")
+	}
 	if err != nil {
 		traceutil.AnnotateError(span, err)
 		return err
@@ -78,29 +83,6 @@ func (e Exporter) publish(ctx context.Context, topic string, msg proto.Message) 
 func (e Exporter) Close() error {
 	e.p.Close()
 	return e.db.Close()
-}
-
-// SaveAttestation publishes to the kafka topic for attestations.
-func (e Exporter) SaveAttestation(ctx context.Context, att *eth.Attestation) error {
-	go func() {
-		if err := e.publish(ctx, "beacon_attestation", att); err != nil {
-			log.WithError(err).Error("Failed to publish attestation")
-		}
-	}()
-
-	return e.db.SaveAttestation(ctx, att)
-}
-
-// SaveAttestations publishes to the kafka topic for beacon attestations.
-func (e Exporter) SaveAttestations(ctx context.Context, atts []*eth.Attestation) error {
-	go func() {
-		for _, att := range atts {
-			if err := e.publish(ctx, "beacon_attestation", att); err != nil {
-				log.WithError(err).Error("Failed to publish attestation")
-			}
-		}
-	}()
-	return e.db.SaveAttestations(ctx, atts)
 }
 
 // SaveBlock publishes to the kafka topic for beacon blocks.

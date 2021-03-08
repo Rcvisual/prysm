@@ -3,11 +3,13 @@
 package depositutil
 
 import (
+	"github.com/pkg/errors"
 	ethpb "github.com/prysmaticlabs/ethereumapis/eth/v1alpha1"
-	"github.com/prysmaticlabs/go-ssz"
 	"github.com/prysmaticlabs/prysm/beacon-chain/core/helpers"
-	pb "github.com/prysmaticlabs/prysm/proto/beacon/p2p/v1"
+	"github.com/prysmaticlabs/prysm/beacon-chain/state"
+	p2ppb "github.com/prysmaticlabs/prysm/proto/beacon/p2p/v1"
 	"github.com/prysmaticlabs/prysm/shared/bls"
+	"github.com/prysmaticlabs/prysm/shared/featureconfig"
 	"github.com/prysmaticlabs/prysm/shared/hashutil"
 	"github.com/prysmaticlabs/prysm/shared/params"
 )
@@ -26,18 +28,14 @@ import (
 //   - Send a transaction on the Ethereum 1.0 chain to DEPOSIT_CONTRACT_ADDRESS executing def deposit(pubkey: bytes[48], withdrawal_credentials: bytes[32], signature: bytes[96]) along with a deposit of amount Gwei.
 //
 // See: https://github.com/ethereum/eth2.0-specs/blob/master/specs/validator/0_beacon-chain-validator.md#submit-deposit
-func DepositInput(
-	depositKey bls.SecretKey,
-	withdrawalKey bls.SecretKey,
-	amountInGwei uint64,
-) (*ethpb.Deposit_Data, [32]byte, error) {
-	di := &ethpb.Deposit_Data{
+func DepositInput(depositKey, withdrawalKey bls.SecretKey, amountInGwei uint64) (*ethpb.Deposit_Data, [32]byte, error) {
+	depositMessage := &p2ppb.DepositMessage{
 		PublicKey:             depositKey.PublicKey().Marshal(),
 		WithdrawalCredentials: WithdrawalCredentialsHash(withdrawalKey),
 		Amount:                amountInGwei,
 	}
 
-	sr, err := ssz.SigningRoot(di)
+	sr, err := depositMessage.HashTreeRoot()
 	if err != nil {
 		return nil, [32]byte{}, err
 	}
@@ -50,13 +48,18 @@ func DepositInput(
 	if err != nil {
 		return nil, [32]byte{}, err
 	}
-	root, err := ssz.HashTreeRoot(&pb.SigningData{ObjectRoot: sr[:], Domain: domain})
+	root, err := (&p2ppb.SigningData{ObjectRoot: sr[:], Domain: domain}).HashTreeRoot()
 	if err != nil {
 		return nil, [32]byte{}, err
 	}
-	di.Signature = depositKey.Sign(root[:]).Marshal()
+	di := &ethpb.Deposit_Data{
+		PublicKey:             depositMessage.PublicKey,
+		WithdrawalCredentials: depositMessage.WithdrawalCredentials,
+		Amount:                depositMessage.Amount,
+		Signature:             depositKey.Sign(root[:]).Marshal(),
+	}
 
-	dr, err := ssz.HashTreeRoot(di)
+	dr, err := di.HashTreeRoot()
 	if err != nil {
 		return nil, [32]byte{}, err
 	}
@@ -74,4 +77,41 @@ func DepositInput(
 func WithdrawalCredentialsHash(withdrawalKey bls.SecretKey) []byte {
 	h := hashutil.Hash(withdrawalKey.PublicKey().Marshal())
 	return append([]byte{params.BeaconConfig().BLSWithdrawalPrefixByte}, h[1:]...)[:32]
+}
+
+// VerifyDepositSignature verifies the correctness of Eth1 deposit BLS signature
+func VerifyDepositSignature(dd *ethpb.Deposit_Data, domain []byte) error {
+	if featureconfig.Get().SkipBLSVerify {
+		return nil
+	}
+	ddCopy := state.CopyDepositData(dd)
+	publicKey, err := bls.PublicKeyFromBytes(ddCopy.PublicKey)
+	if err != nil {
+		return errors.Wrap(err, "could not convert bytes to public key")
+	}
+	sig, err := bls.SignatureFromBytes(ddCopy.Signature)
+	if err != nil {
+		return errors.Wrap(err, "could not convert bytes to signature")
+	}
+	di := &p2ppb.DepositMessage{
+		PublicKey:             ddCopy.PublicKey,
+		WithdrawalCredentials: ddCopy.WithdrawalCredentials,
+		Amount:                ddCopy.Amount,
+	}
+	root, err := di.HashTreeRoot()
+	if err != nil {
+		return errors.Wrap(err, "could not get signing root")
+	}
+	signingData := &p2ppb.SigningData{
+		ObjectRoot: root[:],
+		Domain:     domain,
+	}
+	ctrRoot, err := signingData.HashTreeRoot()
+	if err != nil {
+		return errors.Wrap(err, "could not get container root")
+	}
+	if !sig.Verify(publicKey, ctrRoot[:]) {
+		return helpers.ErrSigFailedToVerify
+	}
+	return nil
 }

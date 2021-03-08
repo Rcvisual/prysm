@@ -1,12 +1,19 @@
 package node
 
 import (
+	"context"
 	"flag"
+	"io/ioutil"
 	"os"
+	"path/filepath"
 	"testing"
 
-	"github.com/prysmaticlabs/prysm/shared/testutil"
-	v1 "github.com/prysmaticlabs/prysm/validator/accounts/v1"
+	"github.com/prysmaticlabs/prysm/shared/testutil/require"
+	"github.com/prysmaticlabs/prysm/validator/accounts"
+	"github.com/prysmaticlabs/prysm/validator/accounts/wallet"
+	"github.com/prysmaticlabs/prysm/validator/flags"
+	"github.com/prysmaticlabs/prysm/validator/keymanager"
+	logTest "github.com/sirupsen/logrus/hooks/test"
 	"github.com/urfave/cli/v2"
 )
 
@@ -14,28 +21,42 @@ import (
 func TestNode_Builds(t *testing.T) {
 	app := cli.App{}
 	set := flag.NewFlagSet("test", 0)
-	set.String("datadir", testutil.TempDir()+"/datadir", "the node data directory")
-	dir := testutil.TempDir() + "/keystore1"
-	defer func() {
-		if err := os.RemoveAll(dir); err != nil {
-			t.Log(err)
-		}
-	}()
-	defer func() {
-		if err := os.RemoveAll(testutil.TempDir() + "/datadir"); err != nil {
-			t.Log(err)
-		}
-	}()
-	set.String("keystore-path", dir, "path to keystore")
-	set.String("password", "1234", "validator account password")
+	set.String("datadir", t.TempDir()+"/datadir", "the node data directory")
+	dir := t.TempDir() + "/walletpath"
+	passwordDir := t.TempDir() + "/password"
+	require.NoError(t, os.MkdirAll(passwordDir, os.ModePerm))
+	passwordFile := filepath.Join(passwordDir, "password.txt")
+	walletPassword := "$$Passw0rdz2$$"
+	require.NoError(t, ioutil.WriteFile(
+		passwordFile,
+		[]byte(walletPassword),
+		os.ModePerm,
+	))
+	set.String("wallet-dir", dir, "path to wallet")
+	set.String("wallet-password-file", passwordFile, "path to wallet password")
+	set.String("keymanager-kind", "imported", "keymanager kind")
 	set.String("verbosity", "debug", "log verbosity")
+	require.NoError(t, set.Set(flags.WalletPasswordFileFlag.Name, passwordFile))
 	context := cli.NewContext(&app, set, nil)
+	_, err := accounts.CreateWalletWithKeymanager(context.Context, &accounts.CreateWalletConfig{
+		WalletCfg: &wallet.Config{
+			WalletDir:      dir,
+			KeymanagerKind: keymanager.Imported,
+			WalletPassword: walletPassword,
+		},
+	})
+	require.NoError(t, err)
 
-	if err := v1.NewValidatorAccount(dir, "1234"); err != nil {
-		t.Fatalf("Could not create validator account: %v", err)
-	}
-	_, err := NewValidatorClient(context)
-	if err != nil {
-		t.Fatalf("Failed to create ValidatorClient: %v", err)
-	}
+	valClient, err := NewValidatorClient(context)
+	require.NoError(t, err, "Failed to create ValidatorClient")
+	err = valClient.db.Close()
+	require.NoError(t, err)
+}
+
+// TestClearDB tests clearing the database
+func TestClearDB(t *testing.T) {
+	hook := logTest.NewGlobal()
+	tmp := filepath.Join(t.TempDir(), "datadirtest")
+	require.NoError(t, clearDB(context.Background(), tmp, true))
+	require.LogsContain(t, hook, "Removing database")
 }

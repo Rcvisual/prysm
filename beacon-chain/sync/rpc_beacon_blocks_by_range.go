@@ -6,11 +6,13 @@ import (
 
 	libp2pcore "github.com/libp2p/go-libp2p-core"
 	"github.com/pkg/errors"
+	types "github.com/prysmaticlabs/eth2-types"
 	ethpb "github.com/prysmaticlabs/ethereumapis/eth/v1alpha1"
 	"github.com/prysmaticlabs/prysm/beacon-chain/db/filters"
 	"github.com/prysmaticlabs/prysm/beacon-chain/flags"
-	"github.com/prysmaticlabs/prysm/beacon-chain/state/stateutil"
+	p2ptypes "github.com/prysmaticlabs/prysm/beacon-chain/p2p/types"
 	pb "github.com/prysmaticlabs/prysm/proto/beacon/p2p/v1"
+	"github.com/prysmaticlabs/prysm/shared/bytesutil"
 	"github.com/prysmaticlabs/prysm/shared/params"
 	"github.com/prysmaticlabs/prysm/shared/traceutil"
 	"go.opencensus.io/trace"
@@ -20,15 +22,9 @@ import (
 func (s *Service) beaconBlocksByRangeRPCHandler(ctx context.Context, msg interface{}, stream libp2pcore.Stream) error {
 	ctx, span := trace.StartSpan(ctx, "sync.BeaconBlocksByRangeHandler")
 	defer span.End()
-	defer func() {
-		if err := stream.Close(); err != nil {
-			log.WithError(err).Error("Failed to close stream")
-		}
-	}()
 	ctx, cancel := context.WithTimeout(ctx, respTimeout)
 	defer cancel()
 	SetRPCStreamDeadlines(stream)
-	log := log.WithField("handler", "beacon_blocks_by_range")
 
 	// Ticker to stagger out large requests.
 	ticker := time.NewTicker(time.Second)
@@ -37,6 +33,12 @@ func (s *Service) beaconBlocksByRangeRPCHandler(ctx context.Context, msg interfa
 	m, ok := msg.(*pb.BeaconBlocksByRangeRequest)
 	if !ok {
 		return errors.New("message is not type *pb.BeaconBlockByRangeRequest")
+	}
+	if err := s.validateRangeRequest(m); err != nil {
+		s.writeErrorResponseToStream(responseCodeInvalidRequest, err.Error(), stream)
+		s.p2p.Peers().Scorers().BadResponsesScorer().Increment(stream.Conn().RemotePeer())
+		traceutil.AnnotateError(span, err)
+		return err
 	}
 
 	// The initial count for the first batch to be returned back.
@@ -47,12 +49,16 @@ func (s *Service) beaconBlocksByRangeRPCHandler(ctx context.Context, msg interfa
 	}
 	// initial batch start and end slots to be returned to remote peer.
 	startSlot := m.StartSlot
-	endSlot := startSlot + (m.Step * (count - 1))
+	endSlot := startSlot.Add(m.Step * (count - 1))
 
 	// The final requested slot from remote peer.
-	endReqSlot := startSlot + (m.Step * (m.Count - 1))
+	endReqSlot := startSlot.Add(m.Step * (m.Count - 1))
 
-	remainingBucketCapacity := s.blocksRateLimiter.Remaining(stream.Conn().RemotePeer().String())
+	blockLimiter, err := s.rateLimiter.topicCollector(string(stream.Protocol()))
+	if err != nil {
+		return err
+	}
+	remainingBucketCapacity := blockLimiter.Remaining(stream.Conn().RemotePeer().String())
 	span.AddAttributes(
 		trace.Int64Attribute("start", int64(startSlot)),
 		trace.Int64Attribute("end", int64(endReqSlot)),
@@ -61,43 +67,40 @@ func (s *Service) beaconBlocksByRangeRPCHandler(ctx context.Context, msg interfa
 		trace.StringAttribute("peer", stream.Conn().RemotePeer().Pretty()),
 		trace.Int64Attribute("remaining_capacity", remainingBucketCapacity),
 	)
-	maxRequestBlocks := params.BeaconNetworkConfig().MaxRequestBlocks
+	// prevRoot is used to ensure that returned chains are strictly linear for singular steps
+	// by comparing the previous root of the block in the list with the current block's parent.
+	var prevRoot [32]byte
 	for startSlot <= endReqSlot {
-		remainingBucketCapacity = s.blocksRateLimiter.Remaining(stream.Conn().RemotePeer().String())
-		if int64(allowedBlocksPerSecond) > remainingBucketCapacity {
-			s.p2p.Peers().IncrementBadResponses(stream.Conn().RemotePeer())
-			if s.p2p.Peers().IsBad(stream.Conn().RemotePeer()) {
-				log.Debug("Disconnecting bad peer")
-				defer func() {
-					if err := s.p2p.Disconnect(stream.Conn().RemotePeer()); err != nil {
-						log.WithError(err).Error("Failed to disconnect peer")
-					}
-				}()
-			}
-			s.writeErrorResponseToStream(responseCodeInvalidRequest, rateLimitedError, stream)
-			return errors.New(rateLimitedError)
-		}
-
-		if endSlot-startSlot > rangeLimit || m.Step == 0 || m.Count > maxRequestBlocks {
-			s.writeErrorResponseToStream(responseCodeInvalidRequest, stepError, stream)
-			err := errors.New(stepError)
+		if err := s.rateLimiter.validateRequest(stream, allowedBlocksPerSecond); err != nil {
 			traceutil.AnnotateError(span, err)
 			return err
 		}
 
-		if err := s.writeBlockRangeToStream(ctx, startSlot, endSlot, m.Step, stream); err != nil {
+		if endSlot-startSlot > rangeLimit {
+			s.writeErrorResponseToStream(responseCodeInvalidRequest, p2ptypes.ErrInvalidRequest.Error(), stream)
+			err := p2ptypes.ErrInvalidRequest
+			traceutil.AnnotateError(span, err)
 			return err
 		}
 
+		err := s.writeBlockRangeToStream(ctx, startSlot, endSlot, m.Step, &prevRoot, stream)
+		if err != nil && !errors.Is(err, p2ptypes.ErrInvalidParent) {
+			return err
+		}
+		// Reduce capacity of peer in the rate limiter first.
 		// Decrease allowed blocks capacity by the number of streamed blocks.
 		if startSlot <= endSlot {
-			s.blocksRateLimiter.Add(
-				stream.Conn().RemotePeer().String(), int64(1+(endSlot-startSlot)/m.Step))
+			s.rateLimiter.add(stream, int64(1+endSlot.SubSlot(startSlot).Div(m.Step)))
+		}
+		// Exit in the event we have a disjoint chain to
+		// return.
+		if errors.Is(err, p2ptypes.ErrInvalidParent) {
+			break
 		}
 
 		// Recalculate start and end slots for the next batch to be returned to the remote peer.
-		startSlot = endSlot + m.Step
-		endSlot = startSlot + (m.Step * (allowedBlocksPerSecond - 1))
+		startSlot = endSlot.Add(m.Step)
+		endSlot = startSlot.Add(m.Step * (allowedBlocksPerSecond - 1))
 		if endSlot > endReqSlot {
 			endSlot = endReqSlot
 		}
@@ -110,25 +113,20 @@ func (s *Service) beaconBlocksByRangeRPCHandler(ctx context.Context, msg interfa
 		// wait for ticker before resuming streaming blocks to remote peer.
 		<-ticker.C
 	}
+	closeStream(stream, log)
 	return nil
 }
 
-func (s *Service) writeBlockRangeToStream(ctx context.Context, startSlot, endSlot, step uint64, stream libp2pcore.Stream) error {
+func (s *Service) writeBlockRangeToStream(ctx context.Context, startSlot, endSlot types.Slot, step uint64,
+	prevRoot *[32]byte, stream libp2pcore.Stream) error {
 	ctx, span := trace.StartSpan(ctx, "sync.WriteBlockRangeToStream")
 	defer span.End()
 
 	filter := filters.NewFilter().SetStartSlot(startSlot).SetEndSlot(endSlot).SetSlotStep(step)
-	blks, err := s.db.Blocks(ctx, filter)
+	blks, roots, err := s.db.Blocks(ctx, filter)
 	if err != nil {
-		log.WithError(err).Error("Failed to retrieve blocks")
-		s.writeErrorResponseToStream(responseCodeServerError, genericError, stream)
-		traceutil.AnnotateError(span, err)
-		return err
-	}
-	roots, err := s.db.BlockRoots(ctx, filter)
-	if err != nil {
-		log.WithError(err).Error("Failed to retrieve block roots")
-		s.writeErrorResponseToStream(responseCodeServerError, genericError, stream)
+		log.WithError(err).Debug("Could not retrieve blocks")
+		s.writeErrorResponseToStream(responseCodeServerError, p2ptypes.ErrGeneric.Error(), stream)
 		traceutil.AnnotateError(span, err)
 		return err
 	}
@@ -136,8 +134,8 @@ func (s *Service) writeBlockRangeToStream(ctx context.Context, startSlot, endSlo
 	if startSlot == 0 {
 		genBlock, genRoot, err := s.retrieveGenesisBlock(ctx)
 		if err != nil {
-			log.WithError(err).Error("Failed to retrieve genesis block")
-			s.writeErrorResponseToStream(responseCodeServerError, genericError, stream)
+			log.WithError(err).Debug("Could not retrieve genesis block")
+			s.writeErrorResponseToStream(responseCodeServerError, p2ptypes.ErrGeneric.Error(), stream)
 			traceutil.AnnotateError(span, err)
 			return err
 		}
@@ -146,47 +144,110 @@ func (s *Service) writeBlockRangeToStream(ctx context.Context, startSlot, endSlo
 	}
 	// Filter and sort our retrieved blocks, so that
 	// we only return valid sets of blocks.
-	blks, roots = s.dedupBlocksAndRoots(blks, roots)
+	blks, roots, err = s.dedupBlocksAndRoots(blks, roots)
+	if err != nil {
+		s.writeErrorResponseToStream(responseCodeServerError, p2ptypes.ErrGeneric.Error(), stream)
+		traceutil.AnnotateError(span, err)
+		return err
+	}
 	blks, roots = s.sortBlocksAndRoots(blks, roots)
-	for i, b := range blks {
+
+	blks, err = s.filterBlocks(ctx, blks, roots, prevRoot, step, startSlot)
+	if err != nil && err != p2ptypes.ErrInvalidParent {
+		s.writeErrorResponseToStream(responseCodeServerError, p2ptypes.ErrGeneric.Error(), stream)
+		traceutil.AnnotateError(span, err)
+		return err
+	}
+	for _, b := range blks {
 		if b == nil || b.Block == nil {
 			continue
 		}
-		blk := b.Block
-
-		// Check that the block is valid according to the request and part of the canonical chain.
-		isRequestedSlotStep := (blk.Slot-startSlot)%step == 0
-		if isRequestedSlotStep {
-			canonical, err := s.chain.IsCanonical(ctx, roots[i])
-			if err != nil {
-				log.WithError(err).Error("Failed to determine canonical block")
-				s.writeErrorResponseToStream(responseCodeServerError, genericError, stream)
-				traceutil.AnnotateError(span, err)
-				return err
-			}
-			if !canonical {
-				continue
-			}
-			if err := s.chunkWriter(stream, b); err != nil {
-				log.WithError(err).Error("Failed to send a chunked response")
-				s.writeErrorResponseToStream(responseCodeServerError, genericError, stream)
-				traceutil.AnnotateError(span, err)
-				return err
-			}
+		if chunkErr := s.chunkWriter(stream, b); chunkErr != nil {
+			log.WithError(chunkErr).Debug("Could not send a chunked response")
+			s.writeErrorResponseToStream(responseCodeServerError, p2ptypes.ErrGeneric.Error(), stream)
+			traceutil.AnnotateError(span, chunkErr)
+			return chunkErr
 		}
+
+	}
+	// Return error in the event we have an invalid parent.
+	return err
+}
+
+func (s *Service) validateRangeRequest(r *pb.BeaconBlocksByRangeRequest) error {
+	startSlot := r.StartSlot
+	count := r.Count
+	step := r.Step
+
+	maxRequestBlocks := params.BeaconNetworkConfig().MaxRequestBlocks
+	// Add a buffer for possible large range requests from nodes syncing close to the
+	// head of the chain.
+	buffer := rangeLimit * 2
+	highestExpectedSlot := s.chain.CurrentSlot().Add(uint64(buffer))
+
+	// Ensure all request params are within appropriate bounds
+	if count == 0 || count > maxRequestBlocks {
+		return p2ptypes.ErrInvalidRequest
+	}
+
+	if step == 0 || step > rangeLimit {
+		return p2ptypes.ErrInvalidRequest
+	}
+
+	if startSlot > highestExpectedSlot {
+		return p2ptypes.ErrInvalidRequest
+	}
+
+	endSlot := startSlot.Add(step * (count - 1))
+	if endSlot-startSlot > rangeLimit {
+		return p2ptypes.ErrInvalidRequest
 	}
 	return nil
 }
 
-func (s *Service) writeErrorResponseToStream(responseCode byte, reason string, stream libp2pcore.Stream) {
-	resp, err := s.generateErrorResponse(responseCode, reason)
-	if err != nil {
-		log.WithError(err).Error("Failed to generate a response error")
-	} else {
-		if _, err := stream.Write(resp); err != nil {
-			log.WithError(err).Errorf("Failed to write to stream")
+// filters all the provided blocks to ensure they are canonical
+// and are strictly linear.
+func (s *Service) filterBlocks(ctx context.Context, blks []*ethpb.SignedBeaconBlock, roots [][32]byte, prevRoot *[32]byte,
+	step uint64, startSlot types.Slot) ([]*ethpb.SignedBeaconBlock, error) {
+	if len(blks) != len(roots) {
+		return nil, errors.New("input blks and roots are diff lengths")
+	}
+
+	newBlks := make([]*ethpb.SignedBeaconBlock, 0, len(blks))
+	for i, b := range blks {
+		isCanonical, err := s.chain.IsCanonical(ctx, roots[i])
+		if err != nil {
+			return nil, err
+		}
+		parentValid := *prevRoot != [32]byte{}
+		isLinear := *prevRoot == bytesutil.ToBytes32(b.Block.ParentRoot)
+		isSingular := step == 1
+		slotDiff, err := b.Block.Slot.SafeSubSlot(startSlot)
+		if err != nil {
+			return nil, err
+		}
+		slotDiff, err = slotDiff.SafeMod(step)
+		if err != nil {
+			return nil, err
+		}
+		isRequestedSlotStep := slotDiff == 0
+		if isRequestedSlotStep && isCanonical {
+			// Exit early if our valid block is non linear.
+			if parentValid && isSingular && !isLinear {
+				return newBlks, p2ptypes.ErrInvalidParent
+			}
+			newBlks = append(newBlks, blks[i])
+			// Set the previous root as the
+			// newly added block's root
+			currRoot := roots[i]
+			prevRoot = &currRoot
 		}
 	}
+	return newBlks, nil
+}
+
+func (s *Service) writeErrorResponseToStream(responseCode byte, reason string, stream libp2pcore.Stream) {
+	writeErrorResponseToStream(responseCode, reason, stream, s.p2p)
 }
 
 func (s *Service) retrieveGenesisBlock(ctx context.Context) (*ethpb.SignedBeaconBlock, [32]byte, error) {
@@ -194,7 +255,7 @@ func (s *Service) retrieveGenesisBlock(ctx context.Context) (*ethpb.SignedBeacon
 	if err != nil {
 		return nil, [32]byte{}, err
 	}
-	genRoot, err := stateutil.BlockRoot(genBlock.Block)
+	genRoot, err := genBlock.Block.HashTreeRoot()
 	if err != nil {
 		return nil, [32]byte{}, err
 	}

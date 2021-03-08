@@ -1,12 +1,11 @@
 package stateutil
 
 import (
-	"bytes"
 	"testing"
 
 	ethpb "github.com/prysmaticlabs/ethereumapis/eth/v1alpha1"
-	"github.com/prysmaticlabs/go-ssz"
 	"github.com/prysmaticlabs/prysm/shared/bytesutil"
+	"github.com/prysmaticlabs/prysm/shared/testutil/require"
 )
 
 func TestAttestationDataRoot_EqualGeneric(t *testing.T) {
@@ -23,17 +22,12 @@ func TestAttestationDataRoot_EqualGeneric(t *testing.T) {
 			Epoch: 9,
 		},
 	}
-	genericHtr, err := ssz.HashTreeRoot(attData)
-	if err != nil {
-		t.Fatal(err)
-	}
+	genericHtr, err := attData.HashTreeRoot()
+	require.NoError(t, err)
 	dataHtr, err := AttestationDataRoot(attData)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(genericHtr[:], dataHtr[:]) {
-		t.Fatalf("Expected %#x, received %#x", genericHtr, dataHtr)
-	}
+	require.NoError(t, err)
+
+	require.DeepEqual(t, genericHtr[:], dataHtr[:])
 }
 
 func BenchmarkAttestationDataRoot(b *testing.B) {
@@ -52,18 +46,14 @@ func BenchmarkAttestationDataRoot(b *testing.B) {
 	}
 	b.Run("generic", func(b *testing.B) {
 		for i := 0; i < b.N; i++ {
-			_, err := ssz.HashTreeRoot(attData)
-			if err != nil {
-				b.Fatal(err)
-			}
+			_, err := attData.HashTreeRoot()
+			require.NoError(b, err)
 		}
 	})
 	b.Run("stateutil", func(b *testing.B) {
 		for i := 0; i < b.N; i++ {
 			_, err := AttestationDataRoot(attData)
-			if err != nil {
-				b.Fatal(err)
-			}
+			require.NoError(b, err)
 		}
 	})
 }

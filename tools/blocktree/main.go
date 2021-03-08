@@ -16,12 +16,10 @@ import (
 	"strconv"
 
 	"github.com/emicklei/dot"
-	"github.com/prysmaticlabs/prysm/beacon-chain/cache"
-	"github.com/prysmaticlabs/prysm/beacon-chain/core/helpers"
+	types "github.com/prysmaticlabs/eth2-types"
 	"github.com/prysmaticlabs/prysm/beacon-chain/db"
 	"github.com/prysmaticlabs/prysm/beacon-chain/db/filters"
-	"github.com/prysmaticlabs/prysm/beacon-chain/state/stateutil"
-	"github.com/prysmaticlabs/prysm/shared/attestationutil"
+	"github.com/prysmaticlabs/prysm/beacon-chain/db/kv"
 	"github.com/prysmaticlabs/prysm/shared/bytesutil"
 )
 
@@ -41,7 +39,7 @@ type node struct {
 
 func main() {
 	flag.Parse()
-	db, err := db.NewDB(*datadir, cache.NewStateSummaryCache())
+	db, err := db.NewDB(context.Background(), *datadir, &kv.Config{})
 	if err != nil {
 		panic(err)
 	}
@@ -50,10 +48,10 @@ func main() {
 	graph.Attr("rankdir", "RL")
 	graph.Attr("labeljust", "l")
 
-	startSlot := uint64(*startSlot)
-	endSlot := uint64(*endSlot)
+	startSlot := types.Slot(*startSlot)
+	endSlot := types.Slot(*endSlot)
 	filter := filters.NewFilter().SetStartSlot(startSlot).SetEndSlot(endSlot)
-	blks, err := db.Blocks(context.Background(), filter)
+	blks, roots, err := db.Blocks(context.Background(), filter)
 	if err != nil {
 		panic(err)
 	}
@@ -62,14 +60,9 @@ func main() {
 	m := make(map[[32]byte]*node)
 	for i := 0; i < len(blks); i++ {
 		b := blks[i]
-		r, err := stateutil.BlockRoot(b.Block)
-		if err != nil {
-			panic(err)
-		}
+		r := roots[i]
 		m[r] = &node{score: make(map[uint64]bool)}
 
-		// Gather votes from the attestations voted for this block
-		atts, err := db.Attestations(context.Background(), filters.NewFilter().SetHeadBlockRoot(r[:]))
 		state, err := db.State(context.Background(), r)
 		if err != nil {
 			panic(err)
@@ -78,35 +71,19 @@ func main() {
 		// If the state is not available, roll back
 		for state == nil {
 			slot--
-			filter := filters.NewFilter().SetStartSlot(slot).SetEndSlot(slot)
-			bs, err := db.Blocks(context.Background(), filter)
+			_, rts, err := db.BlockRootsBySlot(context.Background(), slot)
 			if err != nil {
 				panic(err)
 			}
-			rs, err := stateutil.BlockRoot(bs[0].Block)
+			state, err = db.State(context.Background(), rts[0])
 			if err != nil {
 				panic(err)
-			}
-			state, err = db.State(context.Background(), rs)
-			if err != nil {
-				panic(err)
-			}
-		}
-		// Retrieve attestation indices
-		for _, att := range atts {
-			committee, err := helpers.BeaconCommitteeFromState(state, att.Data.Slot, att.Data.CommitteeIndex)
-			if err != nil {
-				panic(err)
-			}
-			indices := attestationutil.AttestingIndices(att.AggregationBits, committee)
-			for _, i := range indices {
-				m[r].score[i] = true
 			}
 		}
 
 		// Construct label of each node.
 		rStr := hex.EncodeToString(r[:2])
-		label := "slot: " + strconv.Itoa(int(b.Block.Slot)) + "\n root: " + rStr + "\n votes: " + strconv.Itoa(len(m[r].score))
+		label := "slot: " + strconv.Itoa(int(b.Block.Slot)) + "\n root: " + rStr
 
 		dotN := graph.Node(rStr).Box().Attr("label", label)
 		n := &node{

@@ -6,12 +6,14 @@ import (
 	"sort"
 
 	"github.com/pkg/errors"
+	types "github.com/prysmaticlabs/eth2-types"
 	ethpb "github.com/prysmaticlabs/ethereumapis/eth/v1alpha1"
 	"github.com/prysmaticlabs/prysm/beacon-chain/core/blocks"
 	"github.com/prysmaticlabs/prysm/beacon-chain/core/helpers"
 	beaconstate "github.com/prysmaticlabs/prysm/beacon-chain/state"
 	"github.com/prysmaticlabs/prysm/shared/params"
 	"github.com/prysmaticlabs/prysm/shared/sliceutil"
+	"github.com/trailofbits/go-mutexasserts"
 	"go.opencensus.io/trace"
 )
 
@@ -20,28 +22,35 @@ func NewPool() *Pool {
 	return &Pool{
 		pendingProposerSlashing: make([]*ethpb.ProposerSlashing, 0),
 		pendingAttesterSlashing: make([]*PendingAttesterSlashing, 0),
-		included:                make(map[uint64]bool),
+		included:                make(map[types.ValidatorIndex]bool),
 	}
 }
 
 // PendingAttesterSlashings returns attester slashings that are able to be included into a block.
-// This method will not return more than the block enforced MaxAttesterSlashings.
-func (p *Pool) PendingAttesterSlashings(ctx context.Context, state *beaconstate.BeaconState) []*ethpb.AttesterSlashing {
-	p.lock.RLock()
-	defer p.lock.RUnlock()
+// This method will return the amount of pending attester slashings for a block transition unless parameter `noLimit` is true
+// to indicate the request is for noLimit pending items.
+func (p *Pool) PendingAttesterSlashings(ctx context.Context, state *beaconstate.BeaconState, noLimit bool) []*ethpb.AttesterSlashing {
+	p.lock.Lock()
+	defer p.lock.Unlock()
 	ctx, span := trace.StartSpan(ctx, "operations.PendingAttesterSlashing")
 	defer span.End()
 
 	// Update prom metric.
 	numPendingAttesterSlashings.Set(float64(len(p.pendingAttesterSlashing)))
 
-	included := make(map[uint64]bool)
-	pending := make([]*ethpb.AttesterSlashing, 0, params.BeaconConfig().MaxAttesterSlashings)
+	included := make(map[types.ValidatorIndex]bool)
+
+	// Allocate pending slice with a capacity of maxAttesterSlashings or len(p.pendingAttesterSlashing)) depending on the request.
+	maxSlashings := params.BeaconConfig().MaxAttesterSlashings
+	if noLimit {
+		maxSlashings = uint64(len(p.pendingAttesterSlashing))
+	}
+	pending := make([]*ethpb.AttesterSlashing, 0, maxSlashings)
 	for i := 0; i < len(p.pendingAttesterSlashing); i++ {
-		slashing := p.pendingAttesterSlashing[i]
-		if uint64(len(pending)) >= params.BeaconConfig().MaxAttesterSlashings {
+		if uint64(len(pending)) >= maxSlashings {
 			break
 		}
+		slashing := p.pendingAttesterSlashing[i]
 		valid, err := p.validatorSlashingPreconditionCheck(state, slashing.validatorToSlash)
 		if err != nil {
 			log.WithError(err).Error("could not validate attester slashing")
@@ -55,7 +64,7 @@ func (p *Pool) PendingAttesterSlashings(ctx context.Context, state *beaconstate.
 		attSlashing := slashing.attesterSlashing
 		slashedVal := sliceutil.IntersectionUint64(attSlashing.Attestation_1.AttestingIndices, attSlashing.Attestation_2.AttestingIndices)
 		for _, idx := range slashedVal {
-			included[idx] = true
+			included[types.ValidatorIndex(idx)] = true
 		}
 
 		pending = append(pending, attSlashing)
@@ -65,22 +74,28 @@ func (p *Pool) PendingAttesterSlashings(ctx context.Context, state *beaconstate.
 }
 
 // PendingProposerSlashings returns proposer slashings that are able to be included into a block.
-// This method will not return more than the block enforced MaxProposerSlashings.
-func (p *Pool) PendingProposerSlashings(ctx context.Context, state *beaconstate.BeaconState) []*ethpb.ProposerSlashing {
-	p.lock.RLock()
-	defer p.lock.RUnlock()
+// This method will return the amount of pending proposer slashings for a block transition unless the `noLimit` parameter
+// is set to true to indicate the request is for noLimit pending items.
+func (p *Pool) PendingProposerSlashings(ctx context.Context, state *beaconstate.BeaconState, noLimit bool) []*ethpb.ProposerSlashing {
+	p.lock.Lock()
+	defer p.lock.Unlock()
 	ctx, span := trace.StartSpan(ctx, "operations.PendingProposerSlashing")
 	defer span.End()
 
 	// Update prom metric.
 	numPendingProposerSlashings.Set(float64(len(p.pendingProposerSlashing)))
 
-	pending := make([]*ethpb.ProposerSlashing, 0, params.BeaconConfig().MaxProposerSlashings)
+	// Allocate pending slice with a capacity of len(p.pendingProposerSlashing) or maxProposerSlashings depending on the request.
+	maxSlashings := params.BeaconConfig().MaxProposerSlashings
+	if noLimit {
+		maxSlashings = uint64(len(p.pendingProposerSlashing))
+	}
+	pending := make([]*ethpb.ProposerSlashing, 0, maxSlashings)
 	for i := 0; i < len(p.pendingProposerSlashing); i++ {
-		slashing := p.pendingProposerSlashing[i]
-		if uint64(len(pending)) >= params.BeaconConfig().MaxProposerSlashings {
+		if uint64(len(pending)) >= maxSlashings {
 			break
 		}
+		slashing := p.pendingProposerSlashing[i]
 		valid, err := p.validatorSlashingPreconditionCheck(state, slashing.Header_1.Header.ProposerIndex)
 		if err != nil {
 			log.WithError(err).Error("could not validate proposer slashing")
@@ -110,7 +125,6 @@ func (p *Pool) InsertAttesterSlashing(
 	defer span.End()
 
 	if err := blocks.VerifyAttesterSlashing(ctx, state, slashing); err != nil {
-		numPendingAttesterSlashingFailedSigVerify.Inc()
 		return errors.Wrap(err, "could not verify attester slashing")
 	}
 
@@ -118,14 +132,13 @@ func (p *Pool) InsertAttesterSlashing(
 	cantSlash := make([]uint64, 0, len(slashedVal))
 	for _, val := range slashedVal {
 		// Has this validator index been included recently?
-		ok, err := p.validatorSlashingPreconditionCheck(state, val)
+		ok, err := p.validatorSlashingPreconditionCheck(state, types.ValidatorIndex(val))
 		if err != nil {
 			return err
 		}
 		// If the validator has already exited, has already been slashed, or if its index
 		// has been recently included in the pool of slashings, skip including this indice.
 		if !ok {
-			attesterSlashingReattempts.Inc()
 			cantSlash = append(cantSlash, val)
 			continue
 		}
@@ -133,17 +146,16 @@ func (p *Pool) InsertAttesterSlashing(
 		// Check if the validator already exists in the list of slashings.
 		// Use binary search to find the answer.
 		found := sort.Search(len(p.pendingAttesterSlashing), func(i int) bool {
-			return p.pendingAttesterSlashing[i].validatorToSlash >= val
+			return uint64(p.pendingAttesterSlashing[i].validatorToSlash) >= val
 		})
-		if found != len(p.pendingAttesterSlashing) && p.pendingAttesterSlashing[found].validatorToSlash == val {
-			attesterSlashingReattempts.Inc()
+		if found != len(p.pendingAttesterSlashing) && uint64(p.pendingAttesterSlashing[found].validatorToSlash) == val {
 			cantSlash = append(cantSlash, val)
 			continue
 		}
 
 		pendingSlashing := &PendingAttesterSlashing{
 			attesterSlashing: slashing,
-			validatorToSlash: val,
+			validatorToSlash: types.ValidatorIndex(val),
 		}
 		// Insert into pending list and sort again.
 		p.pendingAttesterSlashing = append(p.pendingAttesterSlashing, pendingSlashing)
@@ -171,7 +183,6 @@ func (p *Pool) InsertProposerSlashing(
 	defer span.End()
 
 	if err := blocks.VerifyProposerSlashing(state, slashing); err != nil {
-		numPendingProposerSlashingFailedSigVerify.Inc()
 		return errors.Wrap(err, "could not verify proposer slashing")
 	}
 
@@ -184,7 +195,6 @@ func (p *Pool) InsertProposerSlashing(
 	// has been recently included in the pool of slashings, do not process this new
 	// slashing.
 	if !ok {
-		proposerSlashingReattempts.Inc()
 		return fmt.Errorf("validator at index %d cannot be slashed", idx)
 	}
 
@@ -217,12 +227,12 @@ func (p *Pool) MarkIncludedAttesterSlashing(as *ethpb.AttesterSlashing) {
 	slashedVal := sliceutil.IntersectionUint64(as.Attestation_1.AttestingIndices, as.Attestation_2.AttestingIndices)
 	for _, val := range slashedVal {
 		i := sort.Search(len(p.pendingAttesterSlashing), func(i int) bool {
-			return p.pendingAttesterSlashing[i].validatorToSlash >= val
+			return uint64(p.pendingAttesterSlashing[i].validatorToSlash) >= val
 		})
-		if i != len(p.pendingAttesterSlashing) && p.pendingAttesterSlashing[i].validatorToSlash == val {
+		if i != len(p.pendingAttesterSlashing) && uint64(p.pendingAttesterSlashing[i].validatorToSlash) == val {
 			p.pendingAttesterSlashing = append(p.pendingAttesterSlashing[:i], p.pendingAttesterSlashing[i+1:]...)
 		}
-		p.included[val] = true
+		p.included[types.ValidatorIndex(val)] = true
 		numAttesterSlashingsIncluded.Inc()
 	}
 }
@@ -246,10 +256,15 @@ func (p *Pool) MarkIncludedProposerSlashing(ps *ethpb.ProposerSlashing) {
 // this function checks a few items about a validator before proceeding with inserting
 // a proposer/attester slashing into the pool. First, it checks if the validator
 // has been recently included in the pool, then it checks if the validator is slashable.
+// Note: this method requires caller to hold the lock.
 func (p *Pool) validatorSlashingPreconditionCheck(
 	state *beaconstate.BeaconState,
-	valIdx uint64,
+	valIdx types.ValidatorIndex,
 ) (bool, error) {
+	if !mutexasserts.RWMutexLocked(&p.lock) && !mutexasserts.RWMutexRLocked(&p.lock) {
+		return false, errors.New("pool.validatorSlashingPreconditionCheck: caller must hold read/write lock")
+	}
+
 	// Check if the validator index has been included recently.
 	if p.included[valIdx] {
 		return false, nil

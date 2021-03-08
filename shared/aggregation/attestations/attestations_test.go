@@ -1,20 +1,21 @@
 package attestations
 
 import (
-	"bytes"
 	"fmt"
 	"io/ioutil"
-	"os"
 	"sort"
 	"testing"
 
 	ethpb "github.com/prysmaticlabs/ethereumapis/eth/v1alpha1"
 	"github.com/prysmaticlabs/go-bitfield"
-	"github.com/prysmaticlabs/go-ssz"
 	"github.com/prysmaticlabs/prysm/shared/aggregation"
 	aggtesting "github.com/prysmaticlabs/prysm/shared/aggregation/testing"
+	"github.com/prysmaticlabs/prysm/shared/bls"
 	"github.com/prysmaticlabs/prysm/shared/featureconfig"
 	"github.com/prysmaticlabs/prysm/shared/params"
+	"github.com/prysmaticlabs/prysm/shared/sszutil"
+	"github.com/prysmaticlabs/prysm/shared/testutil/assert"
+	"github.com/prysmaticlabs/prysm/shared/testutil/require"
 	"github.com/sirupsen/logrus"
 )
 
@@ -22,10 +23,10 @@ func TestMain(m *testing.M) {
 	logrus.SetLevel(logrus.DebugLevel)
 	logrus.SetOutput(ioutil.Discard)
 	resetCfg := featureconfig.InitWithReset(&featureconfig.Flags{
-		AttestationAggregationStrategy: string(MaxCoverAggregation),
+		AttestationAggregationStrategy: string(OptMaxCoverAggregation),
 	})
 	defer resetCfg()
-	os.Exit(m.Run())
+	m.Run()
 }
 
 func TestAggregateAttestations_AggregatePair(t *testing.T) {
@@ -52,12 +53,8 @@ func TestAggregateAttestations_AggregatePair(t *testing.T) {
 	}
 	for _, tt := range tests {
 		got, err := AggregatePair(tt.a1, tt.a2)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if !ssz.DeepEqual(got, tt.want) {
-			t.Errorf("AggregatePair() = %v, want %v", got, tt.want)
-		}
+		require.NoError(t, err)
+		require.Equal(t, true, sszutil.DeepEqual(got, tt.want))
 	}
 }
 
@@ -77,9 +74,7 @@ func TestAggregateAttestations_AggregatePair_OverlapFails(t *testing.T) {
 	}
 	for _, tt := range tests {
 		_, err := AggregatePair(tt.a1, tt.a2)
-		if err != aggregation.ErrBitsOverlap {
-			t.Error("Did not receive wanted error")
-		}
+		require.ErrorContains(t, aggregation.ErrBitsOverlap.Error(), err)
 	}
 }
 
@@ -95,9 +90,7 @@ func TestAggregateAttestations_AggregatePair_DiffLengthFails(t *testing.T) {
 	}
 	for _, tt := range tests {
 		_, err := AggregatePair(tt.a1, tt.a2)
-		if err != aggregation.ErrBitsDifferentLen {
-			t.Error("Did not receive wanted error")
-		}
+		require.ErrorContains(t, aggregation.ErrBitsDifferentLen.Error(), err)
 	}
 }
 
@@ -135,16 +128,16 @@ func TestAggregateAttestations_Aggregate(t *testing.T) {
 		},
 		{
 			name:   "256 attestations with single bit set",
-			inputs: aggtesting.BitlistsWithSingleBitSet(t, 256, bitlistLen),
+			inputs: aggtesting.BitlistsWithSingleBitSet(256, bitlistLen),
 			want: []bitfield.Bitlist{
-				aggtesting.BitlistWithAllBitsSet(t, 256),
+				aggtesting.BitlistWithAllBitsSet(256),
 			},
 		},
 		{
 			name:   "1024 attestations with single bit set",
-			inputs: aggtesting.BitlistsWithSingleBitSet(t, 1024, bitlistLen),
+			inputs: aggtesting.BitlistsWithSingleBitSet(1024, bitlistLen),
 			want: []bitfield.Bitlist{
-				aggtesting.BitlistWithAllBitsSet(t, 1024),
+				aggtesting.BitlistWithAllBitsSet(1024),
 			},
 		},
 		{
@@ -220,24 +213,17 @@ func TestAggregateAttestations_Aggregate(t *testing.T) {
 
 	for _, tt := range tests {
 		runner := func() {
-			got, err := Aggregate(aggtesting.MakeAttestationsFromBitlists(t, tt.inputs))
-			if err != nil {
-				t.Fatal(err)
-			}
+			got, err := Aggregate(aggtesting.MakeAttestationsFromBitlists(tt.inputs))
+			require.NoError(t, err)
 			sort.Slice(got, func(i, j int) bool {
 				return got[i].AggregationBits.Bytes()[0] < got[j].AggregationBits.Bytes()[0]
 			})
 			sort.Slice(tt.want, func(i, j int) bool {
 				return tt.want[i].Bytes()[0] < tt.want[j].Bytes()[0]
 			})
-			if len(got) != len(tt.want) {
-				t.Logf("got=%v", got)
-				t.Fatalf("Wrong number of responses. Got %d, wanted %d", len(got), len(tt.want))
-			}
+			assert.Equal(t, len(tt.want), len(got))
 			for i, w := range tt.want {
-				if !bytes.Equal(got[i].AggregationBits.Bytes(), w.Bytes()) {
-					t.Errorf("Unexpected bitlist at index %d, got %b, wanted %b", i, got[i].AggregationBits.Bytes(), w.Bytes())
-				}
+				assert.DeepEqual(t, w.Bytes(), got[i].AggregationBits.Bytes())
 			}
 		}
 		t.Run(fmt.Sprintf("%s/%s", tt.name, NaiveAggregation), func(t *testing.T) {
@@ -253,6 +239,90 @@ func TestAggregateAttestations_Aggregate(t *testing.T) {
 			})
 			defer resetCfg()
 			runner()
+		})
+		t.Run(fmt.Sprintf("%s/%s", tt.name, OptMaxCoverAggregation), func(t *testing.T) {
+			resetCfg := featureconfig.InitWithReset(&featureconfig.Flags{
+				AttestationAggregationStrategy: string(OptMaxCoverAggregation),
+			})
+			defer resetCfg()
+			runner()
+		})
+	}
+}
+
+func TestAggregateAttestations_PerformanceComparison(t *testing.T) {
+	// Tests below are examples of cases where max-cover's greedy approach outperforms the original
+	// naive aggregation (which is very much dependent on order in which items are fed into it).
+	tests := []struct {
+		name     string
+		bitsList [][]byte
+	}{
+		{
+			name: "test1",
+			bitsList: [][]byte{
+				{0b00000100, 0b1},
+				{0b00000010, 0b1},
+				{0b00000001, 0b1},
+				{0b00011001, 0b1},
+			},
+		},
+		{
+			name: "test2",
+			bitsList: [][]byte{
+				{0b10010001, 0b1},
+				{0b00100000, 0b1},
+				{0b01101110, 0b1},
+			},
+		},
+		{
+			name: "test3",
+			bitsList: [][]byte{
+				{0b00100000, 0b00000011, 0b1},
+				{0b00011100, 0b11000000, 0b1},
+				{0b11111100, 0b00000000, 0b1},
+				{0b00000011, 0b10000000, 0b1},
+				{0b11100011, 0b00000000, 0b1},
+			},
+		},
+	}
+
+	scoreAtts := func(atts []*ethpb.Attestation) uint64 {
+		score := uint64(0)
+		sort.Slice(atts, func(i, j int) bool {
+			return atts[i].AggregationBits.Count() > atts[j].AggregationBits.Count()
+		})
+		// Score the best aggregate.
+		if len(atts) > 0 {
+			score = atts[0].AggregationBits.Count()
+		}
+		return score
+	}
+
+	generateAtts := func(bitsList [][]byte) []*ethpb.Attestation {
+		sign := bls.NewAggregateSignature().Marshal()
+		atts := make([]*ethpb.Attestation, 0)
+		for _, b := range bitsList {
+			atts = append(atts, &ethpb.Attestation{
+				AggregationBits: b,
+				Signature:       sign,
+			})
+		}
+		return atts
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			atts, err := NaiveAttestationAggregation(generateAtts(tt.bitsList))
+			require.NoError(t, err)
+			score1 := scoreAtts(atts)
+
+			atts, err = MaxCoverAttestationAggregation(generateAtts(tt.bitsList))
+			require.NoError(t, err)
+			score2 := scoreAtts(atts)
+
+			t.Logf("native = %d, max-cover: %d\n", score1, score2)
+			assert.Equal(t, true, score1 <= score2,
+				"max-cover failed to produce higher score (naive: %d, max-cover: %d)", score1, score2)
 		})
 	}
 }

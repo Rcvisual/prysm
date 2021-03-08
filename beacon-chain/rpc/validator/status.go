@@ -3,13 +3,13 @@ package validator
 import (
 	"context"
 	"errors"
-	"math/big"
-	"time"
 
+	types "github.com/prysmaticlabs/eth2-types"
 	ethpb "github.com/prysmaticlabs/ethereumapis/eth/v1alpha1"
 	"github.com/prysmaticlabs/prysm/beacon-chain/core/helpers"
 	stateTrie "github.com/prysmaticlabs/prysm/beacon-chain/state"
 	"github.com/prysmaticlabs/prysm/shared/bytesutil"
+	"github.com/prysmaticlabs/prysm/shared/depositutil"
 	"github.com/prysmaticlabs/prysm/shared/params"
 	"github.com/prysmaticlabs/prysm/shared/traceutil"
 	"go.opencensus.io/trace"
@@ -18,7 +18,7 @@ import (
 )
 
 var errPubkeyDoesNotExist = errors.New("pubkey does not exist")
-var nonExistentIndex = ^uint64(0)
+var nonExistentIndex = types.ValidatorIndex(^uint64(0))
 
 // ValidatorStatus returns the validator status of the current epoch.
 // The status response can be one of the following:
@@ -68,7 +68,7 @@ func (vs *Server) MultipleValidatorStatus(
 	}
 	// Convert indices to public keys.
 	for _, idx := range req.Indices {
-		pubkeyBytes := headState.PubkeyAtIndex(uint64(idx))
+		pubkeyBytes := headState.PubkeyAtIndex(types.ValidatorIndex(idx))
 		if !filtered[pubkeyBytes] {
 			pubKeys = append(pubKeys, pubkeyBytes[:])
 			filtered[pubkeyBytes] = true
@@ -76,7 +76,7 @@ func (vs *Server) MultipleValidatorStatus(
 	}
 	// Fetch statuses from beacon state.
 	statuses := make([]*ethpb.ValidatorStatusResponse, len(pubKeys))
-	indices := make([]uint64, len(pubKeys))
+	indices := make([]types.ValidatorIndex, len(pubKeys))
 	for i, pubKey := range pubKeys {
 		statuses[i], indices[i] = vs.validatorStatus(ctx, headState, pubKey)
 	}
@@ -127,7 +127,7 @@ func (vs *Server) validatorStatus(
 	ctx context.Context,
 	headState *stateTrie.BeaconState,
 	pubKey []byte,
-) (*ethpb.ValidatorStatusResponse, uint64) {
+) (*ethpb.ValidatorStatusResponse, types.ValidatorIndex) {
 	ctx, span := trace.StartSpan(ctx, "ValidatorServer.validatorStatus")
 	defer span.End()
 
@@ -136,7 +136,7 @@ func (vs *Server) validatorStatus(
 		Status:          ethpb.ValidatorStatus_UNKNOWN_STATUS,
 		ActivationEpoch: params.BeaconConfig().FarFutureEpoch,
 	}
-	vStatus, idx, err := retrieveStatusForPubKey(headState, pubKey)
+	vStatus, idx, err := statusForPubKey(headState, pubKey)
 	if err != nil && err != errPubkeyDoesNotExist {
 		traceutil.AnnotateError(span, err)
 		return resp, nonExistentIndex
@@ -159,38 +159,58 @@ func (vs *Server) validatorStatus(
 			log.Warn("Not connected to ETH1. Cannot determine validator ETH1 deposit block number")
 			return resp, nonExistentIndex
 		}
-		_, eth1BlockNumBigInt := vs.DepositFetcher.DepositByPubkey(ctx, pubKey)
+		deposit, eth1BlockNumBigInt := vs.DepositFetcher.DepositByPubkey(ctx, pubKey)
 		if eth1BlockNumBigInt == nil { // No deposit found in ETH1.
 			return resp, nonExistentIndex
 		}
-
-		// Mark a validator as DEPOSITED if their deposit is visible.
-		resp.Status = ethpb.ValidatorStatus_DEPOSITED
-
-		resp.Eth1DepositBlockNumber = eth1BlockNumBigInt.Uint64()
-
-		depositBlockSlot, err := vs.depositBlockSlot(ctx, headState, eth1BlockNumBigInt)
+		domain, err := helpers.ComputeDomain(
+			params.BeaconConfig().DomainDeposit,
+			nil, /*forkVersion*/
+			nil, /*genesisValidatorsRoot*/
+		)
 		if err != nil {
+			log.Warn("Could not compute domain")
 			return resp, nonExistentIndex
 		}
-		resp.DepositInclusionSlot = depositBlockSlot
+		if err := depositutil.VerifyDepositSignature(deposit.Data, domain); err != nil {
+			resp.Status = ethpb.ValidatorStatus_INVALID
+			log.Warn("Invalid Eth1 deposit")
+			return resp, nonExistentIndex
+		}
+		// Set validator deposit status if their deposit is visible.
+		resp.Status = depositStatus(deposit.Data.Amount)
+		resp.Eth1DepositBlockNumber = eth1BlockNumBigInt.Uint64()
+
 		return resp, nonExistentIndex
-	// Deposited and Pending mean the validator has been put into the state.
-	case ethpb.ValidatorStatus_DEPOSITED, ethpb.ValidatorStatus_PENDING:
-		var lastActivatedValidatorIdx uint64
+	// Deposited, Pending or Partially Deposited mean the validator has been put into the state.
+	case ethpb.ValidatorStatus_DEPOSITED, ethpb.ValidatorStatus_PENDING, ethpb.ValidatorStatus_PARTIALLY_DEPOSITED:
+		if resp.Status == ethpb.ValidatorStatus_PENDING {
+			if vs.DepositFetcher == nil {
+				log.Warn("Not connected to ETH1. Cannot determine validator ETH1 deposit.")
+			} else {
+				// Check if there was a deposit deposit.
+				deposit, eth1BlockNumBigInt := vs.DepositFetcher.DepositByPubkey(ctx, pubKey)
+				if eth1BlockNumBigInt != nil {
+					resp.Status = depositStatus(deposit.Data.Amount)
+					resp.Eth1DepositBlockNumber = eth1BlockNumBigInt.Uint64()
+				}
+			}
+		}
+
+		var lastActivatedvalidatorIndex types.ValidatorIndex
 		for j := headState.NumValidators() - 1; j >= 0; j-- {
-			val, err := headState.ValidatorAtIndexReadOnly(uint64(j))
+			val, err := headState.ValidatorAtIndexReadOnly(types.ValidatorIndex(j))
 			if err != nil {
 				return resp, idx
 			}
 			if helpers.IsActiveValidatorUsingTrie(val, helpers.CurrentEpoch(headState)) {
-				lastActivatedValidatorIdx = uint64(j)
+				lastActivatedvalidatorIndex = types.ValidatorIndex(j)
 				break
 			}
 		}
 		// Our position in the activation queue is the above index - our validator index.
-		if lastActivatedValidatorIdx < idx {
-			resp.PositionInActivationQueue = idx - lastActivatedValidatorIdx
+		if lastActivatedvalidatorIndex < idx {
+			resp.PositionInActivationQueue = uint64(idx - lastActivatedvalidatorIndex)
 		}
 		return resp, idx
 	default:
@@ -198,30 +218,31 @@ func (vs *Server) validatorStatus(
 	}
 }
 
-func retrieveStatusForPubKey(headState *stateTrie.BeaconState, pubKey []byte) (ethpb.ValidatorStatus, uint64, error) {
+func statusForPubKey(headState *stateTrie.BeaconState, pubKey []byte) (ethpb.ValidatorStatus, types.ValidatorIndex, error) {
 	if headState == nil {
 		return ethpb.ValidatorStatus_UNKNOWN_STATUS, 0, errors.New("head state does not exist")
 	}
 	idx, ok := headState.ValidatorIndexByPubkey(bytesutil.ToBytes48(pubKey))
-	if !ok || idx >= uint64(headState.NumValidators()) {
+	if !ok || uint64(idx) >= uint64(headState.NumValidators()) {
 		return ethpb.ValidatorStatus_UNKNOWN_STATUS, 0, errPubkeyDoesNotExist
 	}
 	return assignmentStatus(headState, idx), idx, nil
 }
 
-func assignmentStatus(beaconState *stateTrie.BeaconState, validatorIdx uint64) ethpb.ValidatorStatus {
-	validator, err := beaconState.ValidatorAtIndexReadOnly(validatorIdx)
+func assignmentStatus(beaconState *stateTrie.BeaconState, validatorIndex types.ValidatorIndex) ethpb.ValidatorStatus {
+	validator, err := beaconState.ValidatorAtIndexReadOnly(validatorIndex)
 	if err != nil {
 		return ethpb.ValidatorStatus_UNKNOWN_STATUS
 	}
 	currentEpoch := helpers.CurrentEpoch(beaconState)
 	farFutureEpoch := params.BeaconConfig().FarFutureEpoch
+	validatorBalance := validator.EffectiveBalance()
 
-	if validator == nil {
+	if validator.IsNil() {
 		return ethpb.ValidatorStatus_UNKNOWN_STATUS
 	}
 	if currentEpoch < validator.ActivationEligibilityEpoch() {
-		return ethpb.ValidatorStatus_DEPOSITED
+		return depositStatus(validatorBalance)
 	}
 	if currentEpoch < validator.ActivationEpoch() {
 		return ethpb.ValidatorStatus_PENDING
@@ -238,26 +259,11 @@ func assignmentStatus(beaconState *stateTrie.BeaconState, validatorIdx uint64) e
 	return ethpb.ValidatorStatus_EXITED
 }
 
-func (vs *Server) depositBlockSlot(ctx context.Context, beaconState *stateTrie.BeaconState, eth1BlockNumBigInt *big.Int) (uint64, error) {
-	var depositBlockSlot uint64
-	blockTimeStamp, err := vs.BlockFetcher.BlockTimeByHeight(ctx, eth1BlockNumBigInt)
-	if err != nil {
-		return 0, err
+func depositStatus(depositOrBalance uint64) ethpb.ValidatorStatus {
+	if depositOrBalance == 0 {
+		return ethpb.ValidatorStatus_PENDING
+	} else if depositOrBalance < params.BeaconConfig().MaxEffectiveBalance {
+		return ethpb.ValidatorStatus_PARTIALLY_DEPOSITED
 	}
-	followTime := time.Duration(params.BeaconConfig().Eth1FollowDistance*params.BeaconConfig().SecondsPerETH1Block) * time.Second
-	eth1UnixTime := time.Unix(int64(blockTimeStamp), 0).Add(followTime)
-	period := params.BeaconConfig().SlotsPerEpoch * params.BeaconConfig().EpochsPerEth1VotingPeriod
-	votingPeriod := time.Duration(period*params.BeaconConfig().SecondsPerSlot) * time.Second
-	timeToInclusion := eth1UnixTime.Add(votingPeriod)
-
-	eth2Genesis := time.Unix(int64(beaconState.GenesisTime()), 0)
-
-	if eth2Genesis.After(timeToInclusion) {
-		depositBlockSlot = 0
-	} else {
-		eth2TimeDifference := timeToInclusion.Sub(eth2Genesis).Seconds()
-		depositBlockSlot = uint64(eth2TimeDifference) / params.BeaconConfig().SecondsPerSlot
-	}
-
-	return depositBlockSlot, nil
+	return ethpb.ValidatorStatus_DEPOSITED
 }

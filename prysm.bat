@@ -47,7 +47,7 @@ if %WinOS%==64BIT (
 mkdir %wrapper_dir%
 
 REM get_prysm_version - Find the latest Prysm version available for download.
-(for /f %%i in ('curl -f -s https://prysmaticlabs.com/releases/latest') do set prysm_version=%%i) || (echo [31mERROR: Starting prysm requires an internet connection. If you are being blocked by your antivirus, you can re-run with --ssl-no-revoke [0m && exit /b 1)
+(for /f %%i in ('curl -f -s https://prysmaticlabs.com/releases/latest') do set prysm_version=%%i) || (echo [31mERROR: Starting prysm requires an internet connection. If you are being blocked by your antivirus, you can download the beacon chain and validator executables from our releases page on Github here https://github.com/prysmaticlabs/prysm/releases/ [0m && exit /b 1)
 echo [37mLatest prysm release is %prysm_version%.[0m
 IF defined USE_PRYSM_VERSION (
     echo [33mdetected variable USE_PRYSM_VERSION=%USE_PRYSM_VERSION%[0m
@@ -64,7 +64,7 @@ set SLASHER_REAL=%wrapper_dir%\slasher-%prysm_version%-%system%-%arch%
 
 if [%1]==[beacon-chain] (
     if exist %BEACON_CHAIN_REAL% (
-        Beacon chain is up to date.
+        echo [32mBeacon chain is up to date.[0m
     ) else (
         echo [35mDownloading beacon chain %prysm_version% to %BEACON_CHAIN_REAL% %reason%[0m
         curl -L https://prysmaticlabs.com/releases/beacon-chain-%prysm_version%-%system%-%arch% -o %BEACON_CHAIN_REAL%
@@ -75,7 +75,7 @@ if [%1]==[beacon-chain] (
 
 if [%1]==[validator] (
     if exist %VALIDATOR_REAL% (
-        Validator is up to date.
+        echo [32mValidator is up to date.[0m
     ) else (
         echo [35mDownloading validator %prysm_version% to %VALIDATOR_REAL% %reason%[0m
         curl -L https://prysmaticlabs.com/releases/validator-%prysm_version%-%system%-%arch% -o %VALIDATOR_REAL%
@@ -86,7 +86,7 @@ if [%1]==[validator] (
 
 if [%1]==[slasher] (
     if exist %SLASHER_REAL% (
-        Slasher is up to date.
+        echo [32mSlasher is up to date.[0m
     ) else (
         echo [35mDownloading slasher %prysm_version% to %SLASHER_REAL% %reason%[0m
         curl -L https://prysmaticlabs.com/releases/slasher-%prysm_version%-%system%-%arch% -o %SLASHER_REAL%

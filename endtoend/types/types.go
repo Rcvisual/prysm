@@ -3,6 +3,7 @@
 package types
 
 import (
+	types "github.com/prysmaticlabs/eth2-types"
 	"google.golang.org/grpc"
 )
 
@@ -14,6 +15,7 @@ type E2EConfig struct {
 	TestSync       bool
 	TestSlasher    bool
 	TestDeposits   bool
+	UsePprof       bool
 	Evaluators     []Evaluator
 }
 
@@ -21,13 +23,6 @@ type E2EConfig struct {
 // conduct the current beacon state during the E2E.
 type Evaluator struct {
 	Name       string
-	Policy     func(currentEpoch uint64) bool
+	Policy     func(currentEpoch types.Epoch) bool
 	Evaluation func(conn ...*grpc.ClientConn) error // A variable amount of conns is allowed to be passed in for evaluations to check all nodes if needed.
-}
-
-// BeaconNodeInfo contains the info of ports and other required information
-// needed to communicate with the beacon node it represents.
-type BeaconNodeInfo struct {
-	ProcessID int
-	MultiAddr string
 }

@@ -17,8 +17,8 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/ethclient"
 	"github.com/ethereum/go-ethereum/params"
+	_ "github.com/prysmaticlabs/prysm/shared/maxprocs"
 	"github.com/sirupsen/logrus"
-	_ "go.uber.org/automaxprocs"
 )
 
 var (
@@ -60,7 +60,7 @@ func main() {
 			t1 := time.Now()
 			fmt.Printf("Checking %v wallets...\n", len(allWatching))
 			for _, v := range allWatching {
-				v.Balance = GetEthBalance(v.Address).String()
+				v.Balance = EthBalance(v.Address).String()
 				totalLoaded++
 			}
 			t2 := time.Now()
@@ -93,8 +93,8 @@ func ConnectionToGeth(url string) error {
 	return err
 }
 
-// GetEthBalance from remote server.
-func GetEthBalance(address string) *big.Float {
+// EthBalance from remote server.
+func EthBalance(address string) *big.Float {
 	balance, err := eth.BalanceAt(context.TODO(), common.HexToAddress(address), nil)
 	if err != nil {
 		fmt.Printf("Error fetching ETH Balance for address: %v\n", address)
@@ -120,7 +120,7 @@ func ToEther(o *big.Int) *big.Float {
 }
 
 // MetricsHTTP - HTTP response handler for /metrics.
-func MetricsHTTP(w http.ResponseWriter, r *http.Request) {
+func MetricsHTTP(w http.ResponseWriter, _ *http.Request) {
 	var allOut []string
 	total := big.NewFloat(0)
 	for _, v := range allWatching {
@@ -132,10 +132,12 @@ func MetricsHTTP(w http.ResponseWriter, r *http.Request) {
 		total.Add(total, bal)
 		allOut = append(allOut, fmt.Sprintf("%veth_balance{name=\"%v\",address=\"%v\"} %v", *prefix, v.Name, v.Address, v.Balance))
 	}
-	allOut = append(allOut, fmt.Sprintf("%veth_balance_total %0.18f", *prefix, total))
-	allOut = append(allOut, fmt.Sprintf("%veth_load_seconds %0.2f", *prefix, loadSeconds))
-	allOut = append(allOut, fmt.Sprintf("%veth_loaded_addresses %v", *prefix, totalLoaded))
-	allOut = append(allOut, fmt.Sprintf("%veth_total_addresses %v", *prefix, len(allWatching)))
+	allOut = append(allOut,
+		fmt.Sprintf("%veth_balance_total %0.18f", *prefix, total),
+		fmt.Sprintf("%veth_load_seconds %0.2f", *prefix, loadSeconds),
+		fmt.Sprintf("%veth_loaded_addresses %v", *prefix, totalLoaded),
+		fmt.Sprintf("%veth_total_addresses %v", *prefix, len(allWatching)))
+
 	if _, err := fmt.Fprintln(w, strings.Join(allOut, "\n")); err != nil {
 		logrus.WithError(err).Error("Failed to write metrics")
 	}

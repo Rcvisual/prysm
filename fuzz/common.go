@@ -2,39 +2,18 @@ package fuzz
 
 import (
 	"os"
-	"strings"
 
-	stateTrie "github.com/prysmaticlabs/prysm/beacon-chain/state"
 	"github.com/prysmaticlabs/prysm/shared/featureconfig"
 )
 
+const EnvBls = "BLS_ENABLED"
+
 func init() {
+	var blsEnabled bool
+	if value, exists := os.LookupEnv(EnvBls); exists {
+		blsEnabled = value == "1"
+	}
 	featureconfig.Init(&featureconfig.Flags{
-		SkipBLSVerify: true,
+		SkipBLSVerify: !blsEnabled,
 	})
-}
-
-func fail(err error) ([]byte, bool) {
-	shouldPanic := false
-	if val, ok := os.LookupEnv("PANIC_ON_ERROR"); ok {
-		shouldPanic = strings.ToLower(val) == "true"
-	}
-	if shouldPanic {
-		panic(err)
-	}
-	return nil, false
-}
-
-func success(post *stateTrie.BeaconState) ([]byte, bool) {
-	if val, ok := os.LookupEnv("RETURN_SSZ_POST_STATE"); ok {
-		if strings.ToLower(val) != "true" {
-			return nil, true
-		}
-	}
-
-	result, err := post.InnerStateUnsafe().MarshalSSZ()
-	if err != nil {
-		panic(err)
-	}
-	return result, true
 }

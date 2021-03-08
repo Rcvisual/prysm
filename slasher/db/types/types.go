@@ -5,6 +5,7 @@ package types
 // SlashingStatus enum like structure.
 type SlashingStatus uint8
 
+//noinspection GoUnusedConst
 const (
 	// Unknown default status in case it is not set
 	Unknown = iota
@@ -23,20 +24,20 @@ const (
 	UseDB = false
 )
 
-func (status SlashingStatus) String() string {
+func (s SlashingStatus) String() string {
 	names := [...]string{
 		"Unknown",
 		"Active",
 		"Included",
 		"Reverted"}
 
-	if status < Active || status > Reverted {
+	if s < Active || s > Reverted {
 		return "Unknown"
 	}
 	// return the name of a SlashingStatus
 	// constant from the names array
 	// above.
-	return names[status]
+	return names[s]
 }
 
 // SlashingType enum like type of slashing proof.
@@ -50,14 +51,14 @@ const (
 )
 
 // String returns the string representation of the status SlashingType.
-func (status SlashingType) String() string {
+func (t SlashingType) String() string {
 	names := [...]string{
 		"Proposal",
 		"Attestation",
 	}
 
-	if status < Active || status > Reverted {
+	if t < Active || t > Reverted {
 		return "Unknown"
 	}
-	return names[status]
+	return names[t]
 }

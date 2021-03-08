@@ -9,13 +9,13 @@ import (
 	"regexp"
 	"strings"
 
+	fssz "github.com/ferranbt/fastssz"
 	"github.com/kr/pretty"
 	ethpb "github.com/prysmaticlabs/ethereumapis/eth/v1alpha1"
-	"github.com/prysmaticlabs/go-ssz"
 	"github.com/prysmaticlabs/prysm/beacon-chain/core/state"
 	stateTrie "github.com/prysmaticlabs/prysm/beacon-chain/state"
-	"github.com/prysmaticlabs/prysm/beacon-chain/state/stateutil"
 	pb "github.com/prysmaticlabs/prysm/proto/beacon/p2p/v1"
+	"github.com/prysmaticlabs/prysm/shared/sszutil"
 	"github.com/prysmaticlabs/prysm/shared/version"
 	log "github.com/sirupsen/logrus"
 	"github.com/urfave/cli/v2"
@@ -37,7 +37,7 @@ func main() {
 	app := cli.App{}
 	app.Name = "pcli"
 	app.Usage = "A command line utility to run eth2 specific commands"
-	app.Version = version.GetVersion()
+	app.Version = version.Version()
 	app.Commands = []*cli.Command{
 		{
 			Name:    "pretty",
@@ -68,7 +68,7 @@ func main() {
 				},
 			},
 			Action: func(c *cli.Context) error {
-				var data interface{}
+				var data fssz.Unmarshaler
 				switch sszType {
 				case "block":
 					data = &ethpb.BeaconBlock{}
@@ -80,6 +80,8 @@ func main() {
 					data = &ethpb.BeaconBlockHeader{}
 				case "deposit":
 					data = &ethpb.Deposit{}
+				case "deposit_message":
+					data = &pb.DepositMessage{}
 				case "proposer_slashing":
 					data = &ethpb.ProposerSlashing{}
 				case "signed_block_header":
@@ -127,7 +129,7 @@ func main() {
 					if err != nil {
 						log.Fatal(err)
 					}
-					if text = strings.Replace(text, "\n", "", -1); text == "" {
+					if text = strings.ReplaceAll(text, "\n", ""); text == "" {
 						log.Fatal("Empty block path given")
 					}
 					blockPath = text
@@ -136,7 +138,7 @@ func main() {
 				if err := dataFetcher(blockPath, block); err != nil {
 					log.Fatal(err)
 				}
-				blkRoot, err := stateutil.BlockRoot(block.Block)
+				blkRoot, err := block.Block.HashTreeRoot()
 				if err != nil {
 					log.Fatal(err)
 				}
@@ -148,7 +150,7 @@ func main() {
 					if err != nil {
 						log.Fatal(err)
 					}
-					if text = strings.Replace(text, "\n", "", -1); text == "" {
+					if text = strings.ReplaceAll(text, "\n", ""); text == "" {
 						log.Fatal("Empty state path given")
 					}
 					preStatePath = text
@@ -178,6 +180,9 @@ func main() {
 					log.Fatal(err)
 				}
 				postRoot, err := postState.HashTreeRoot(context.Background())
+				if err != nil {
+					log.Fatal(err)
+				}
 				log.Infof("Finished state transition with post state root of %#x", postRoot)
 
 				// Diff the state if a post state is provided.
@@ -186,7 +191,7 @@ func main() {
 					if err := dataFetcher(expectedPostStatePath, expectedState); err != nil {
 						log.Fatal(err)
 					}
-					if !ssz.DeepEqual(expectedState, postState.InnerStateUnsafe()) {
+					if !sszutil.DeepEqual(expectedState, postState.InnerStateUnsafe()) {
 						diff, _ := messagediff.PrettyDiff(expectedState, postState.InnerStateUnsafe())
 						log.Errorf("Derived state differs from provided post state: %s", diff)
 					}
@@ -202,15 +207,15 @@ func main() {
 }
 
 // dataFetcher fetches and unmarshals data from file to provided data structure.
-func dataFetcher(fPath string, data interface{}) error {
+func dataFetcher(fPath string, data fssz.Unmarshaler) error {
 	rawFile, err := ioutil.ReadFile(fPath)
 	if err != nil {
 		return err
 	}
-	return ssz.Unmarshal(rawFile, data)
+	return data.UnmarshalSSZ(rawFile)
 }
 
-func prettyPrint(sszPath string, data interface{}) {
+func prettyPrint(sszPath string, data fssz.Unmarshaler) {
 	if err := dataFetcher(sszPath, data); err != nil {
 		log.Fatal(err)
 	}

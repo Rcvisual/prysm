@@ -8,7 +8,8 @@ import (
 
 	"github.com/bazelbuild/buildtools/file"
 	pb "github.com/prysmaticlabs/prysm/proto/cluster"
-	_ "go.uber.org/automaxprocs"
+	_ "github.com/prysmaticlabs/prysm/shared/maxprocs"
+	"github.com/prysmaticlabs/prysm/shared/params"
 	"google.golang.org/grpc"
 )
 
@@ -31,6 +32,8 @@ type UnencryptedKeys struct {
 }
 
 func main() {
+	params.UsePyrmontConfig()
+
 	flag.Parse()
 
 	fmt.Printf("Starting client to fetch private key for pod %s\n", *podName)

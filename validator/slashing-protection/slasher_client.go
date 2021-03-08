@@ -3,7 +3,9 @@ package slashingprotection
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
+	"time"
 
 	middleware "github.com/grpc-ecosystem/go-grpc-middleware"
 	grpc_retry "github.com/grpc-ecosystem/go-grpc-middleware/retry"
@@ -11,11 +13,10 @@ import (
 	grpc_prometheus "github.com/grpc-ecosystem/go-grpc-prometheus"
 	ethsl "github.com/prysmaticlabs/prysm/proto/slashing"
 	"github.com/prysmaticlabs/prysm/shared/grpcutils"
-	log "github.com/sirupsen/logrus"
 	"go.opencensus.io/plugin/ocgrpc"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/credentials"
-	"google.golang.org/grpc/metadata"
 )
 
 // Service represents a service to manage the validator
@@ -30,6 +31,7 @@ type Service struct {
 	grpcRetries        uint
 	grpcHeaders        []string
 	slasherClient      ethsl.SlasherClient
+	grpcRetryDelay     time.Duration
 }
 
 // Config for the validator service.
@@ -38,12 +40,13 @@ type Config struct {
 	CertFlag                   string
 	GrpcMaxCallRecvMsgSizeFlag int
 	GrpcRetriesFlag            uint
+	GrpcRetryDelay             time.Duration
 	GrpcHeadersFlag            string
 }
 
-// NewSlashingProtectionService creates a new validator service for the service
+// NewService creates a new validator service for the service
 // registry.
-func NewSlashingProtectionService(ctx context.Context, cfg *Config) (*Service, error) {
+func NewService(ctx context.Context, cfg *Config) (*Service, error) {
 	ctx, cancel := context.WithCancel(ctx)
 	return &Service{
 		ctx:                ctx,
@@ -52,6 +55,7 @@ func NewSlashingProtectionService(ctx context.Context, cfg *Config) (*Service, e
 		withCert:           cfg.CertFlag,
 		maxCallRecvMsgSize: cfg.GrpcMaxCallRecvMsgSizeFlag,
 		grpcRetries:        cfg.GrpcRetriesFlag,
+		grpcRetryDelay:     cfg.GrpcRetryDelay,
 		grpcHeaders:        strings.Split(cfg.GrpcHeadersFlag, ","),
 	}, nil
 }
@@ -78,23 +82,13 @@ func (s *Service) startSlasherClient() ethsl.SlasherClient {
 		log.Warn("You are using an insecure slasher gRPC connection! Please provide a certificate and key to use a secure connection.")
 	}
 
-	md := make(metadata.MD)
-	for _, hdr := range s.grpcHeaders {
-		if hdr != "" {
-			ss := strings.Split(hdr, "=")
-			if len(ss) != 2 {
-				log.Warnf("Incorrect gRPC header flag format. Skipping %v", hdr)
-				continue
-			}
-			md.Set(ss[0], ss[1])
-		}
-	}
+	s.ctx = grpcutils.AppendHeaders(s.ctx, s.grpcHeaders)
 
 	opts := []grpc.DialOption{
 		dialOpt,
 		grpc.WithDefaultCallOptions(
 			grpc_retry.WithMax(s.grpcRetries),
-			grpc.Header(&md),
+			grpc_retry.WithBackoff(grpc_retry.BackoffLinear(s.grpcRetryDelay)),
 		),
 		grpc.WithStatsHandler(&ocgrpc.ClientHandler{}),
 		grpc.WithStreamInterceptor(middleware.ChainStreamClient(
@@ -106,7 +100,7 @@ func (s *Service) startSlasherClient() ethsl.SlasherClient {
 			grpc_opentracing.UnaryClientInterceptor(),
 			grpc_prometheus.UnaryClientInterceptor,
 			grpc_retry.UnaryClientInterceptor(),
-			grpcutils.LogGRPCRequests,
+			grpcutils.LogRequests,
 		)),
 	}
 	conn, err := grpc.DialContext(s.ctx, s.endpoint, opts...)
@@ -130,12 +124,14 @@ func (s *Service) Stop() error {
 	return nil
 }
 
-// Status ...
-//
-// WIP - not done.
+// Status checks if the connection to slasher server is ready,
+// returns error otherwise.
 func (s *Service) Status() error {
 	if s.conn == nil {
 		return errors.New("no connection to slasher RPC")
+	}
+	if s.conn.GetState() != connectivity.Ready {
+		return fmt.Errorf("can`t connect to slasher server at: %v connection status: %v ", s.endpoint, s.conn.GetState())
 	}
 	return nil
 }

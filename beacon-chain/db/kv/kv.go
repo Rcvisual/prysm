@@ -3,35 +3,55 @@
 package kv
 
 import (
+	"context"
 	"os"
 	"path"
-	"sync"
 	"time"
 
 	"github.com/dgraph-io/ristretto"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	prombolt "github.com/prysmaticlabs/prombbolt"
-	"github.com/prysmaticlabs/prysm/beacon-chain/cache"
 	"github.com/prysmaticlabs/prysm/beacon-chain/db/iface"
+	"github.com/prysmaticlabs/prysm/shared/fileutil"
 	"github.com/prysmaticlabs/prysm/shared/params"
 	bolt "go.etcd.io/bbolt"
 )
 
-var _ = iface.Database(&Store{})
+var _ iface.Database = (*Store)(nil)
 
 const (
 	// VotesCacheSize with 1M validators will be 8MB.
 	VotesCacheSize = 1 << 23
 	// NumOfVotes specifies the vote cache size.
-	NumOfVotes       = 1 << 20
-	databaseFileName = "beaconchain.db"
-	boltAllocSize    = 8 * 1024 * 1024
+	NumOfVotes = 1 << 20
+	// BeaconNodeDbDirName is the name of the directory containing the beacon node database.
+	BeaconNodeDbDirName = "beaconchaindata"
+	// DatabaseFileName is the name of the beacon node database.
+	DatabaseFileName = "beaconchain.db"
+
+	boltAllocSize = 8 * 1024 * 1024
 )
 
 // BlockCacheSize specifies 1000 slots worth of blocks cached, which
 // would be approximately 2MB
 var BlockCacheSize = int64(1 << 21)
+
+// blockedBuckets represents the buckets that we want to restrict
+// from our metrics fetching for performance reasons. For a detailed
+// summary, it can be read in https://github.com/prysmaticlabs/prysm/issues/8274.
+var blockedBuckets = [][]byte{
+	blocksBucket,
+	stateSummaryBucket,
+	blockParentRootIndicesBucket,
+	blockSlotIndicesBucket,
+	finalizedBlockRootsIndexBucket,
+}
+
+// Config for the bolt db kv store.
+type Config struct {
+	InitialMMapSize int
+}
 
 // Store defines an implementation of the Prysm Database interface
 // using BoltDB as the underlying persistent kv-store for eth2.
@@ -40,22 +60,34 @@ type Store struct {
 	databasePath        string
 	blockCache          *ristretto.Cache
 	validatorIndexCache *ristretto.Cache
-	stateSlotBitLock    sync.Mutex
-	blockSlotBitLock    sync.Mutex
-	stateSummaryCache   *cache.StateSummaryCache
+	stateSummaryCache   *stateSummaryCache
+	ctx                 context.Context
 }
 
 // NewKVStore initializes a new boltDB key-value store at the directory
 // path specified, creates the kv-buckets based on the schema, and stores
 // an open connection db object as a property of the Store struct.
-func NewKVStore(dirPath string, stateSummaryCache *cache.StateSummaryCache) (*Store, error) {
-	if err := os.MkdirAll(dirPath, 0700); err != nil {
+func NewKVStore(ctx context.Context, dirPath string, config *Config) (*Store, error) {
+	hasDir, err := fileutil.HasDir(dirPath)
+	if err != nil {
 		return nil, err
 	}
-	datafile := path.Join(dirPath, databaseFileName)
-	boltDB, err := bolt.Open(datafile, params.BeaconIoConfig().ReadWritePermissions, &bolt.Options{Timeout: 1 * time.Second, InitialMmapSize: 10e6})
+	if !hasDir {
+		if err := fileutil.MkdirAll(dirPath); err != nil {
+			return nil, err
+		}
+	}
+	datafile := path.Join(dirPath, DatabaseFileName)
+	boltDB, err := bolt.Open(
+		datafile,
+		params.BeaconIoConfig().ReadWritePermissions,
+		&bolt.Options{
+			Timeout:         1 * time.Second,
+			InitialMmapSize: config.InitialMMapSize,
+		},
+	)
 	if err != nil {
-		if err == bolt.ErrTimeout {
+		if errors.Is(err, bolt.ErrTimeout) {
 			return nil, errors.New("cannot obtain database lock, database may be in use by another process")
 		}
 		return nil, err
@@ -84,7 +116,8 @@ func NewKVStore(dirPath string, stateSummaryCache *cache.StateSummaryCache) (*St
 		databasePath:        dirPath,
 		blockCache:          blockCache,
 		validatorIndexCache: validatorCache,
-		stateSummaryCache:   stateSummaryCache,
+		stateSummaryCache:   newStateSummaryCache(),
+		ctx:                 ctx,
 	}
 
 	if err := kv.db.Update(func(tx *bolt.Tx) error {
@@ -98,14 +131,8 @@ func NewKVStore(dirPath string, stateSummaryCache *cache.StateSummaryCache) (*St
 			voluntaryExitsBucket,
 			chainMetadataBucket,
 			checkpointBucket,
-			archivedValidatorSetChangesBucket,
-			archivedCommitteeInfoBucket,
-			archivedBalancesBucket,
-			archivedValidatorParticipationBucket,
 			powchainBucket,
 			stateSummaryBucket,
-			archivedIndexRootBucket,
-			slotsHasObjectBucket,
 			// Indices buckets.
 			attestationHeadBlockRootBucket,
 			attestationSourceRootIndicesBucket,
@@ -113,10 +140,13 @@ func NewKVStore(dirPath string, stateSummaryCache *cache.StateSummaryCache) (*St
 			attestationTargetRootIndicesBucket,
 			attestationTargetEpochIndicesBucket,
 			blockSlotIndicesBucket,
+			stateSlotIndicesBucket,
 			blockParentRootIndicesBucket,
 			finalizedBlockRootsIndexBucket,
 			// New State Management service bucket.
 			newStateServiceCompatibleBucket,
+			// Migrations
+			migrationsBucket,
 		)
 	}); err != nil {
 		return nil, err
@@ -128,26 +158,32 @@ func NewKVStore(dirPath string, stateSummaryCache *cache.StateSummaryCache) (*St
 }
 
 // ClearDB removes the previously stored database in the data directory.
-func (kv *Store) ClearDB() error {
-	if _, err := os.Stat(kv.databasePath); os.IsNotExist(err) {
+func (s *Store) ClearDB() error {
+	if _, err := os.Stat(s.databasePath); os.IsNotExist(err) {
 		return nil
 	}
-	prometheus.Unregister(createBoltCollector(kv.db))
-	if err := os.Remove(path.Join(kv.databasePath, databaseFileName)); err != nil {
+	prometheus.Unregister(createBoltCollector(s.db))
+	if err := os.Remove(path.Join(s.databasePath, DatabaseFileName)); err != nil {
 		return errors.Wrap(err, "could not remove database file")
 	}
 	return nil
 }
 
 // Close closes the underlying BoltDB database.
-func (kv *Store) Close() error {
-	prometheus.Unregister(createBoltCollector(kv.db))
-	return kv.db.Close()
+func (s *Store) Close() error {
+	prometheus.Unregister(createBoltCollector(s.db))
+
+	// Before DB closes, we should dump the cached state summary objects to DB.
+	if err := s.saveCachedStateSummariesDB(s.ctx); err != nil {
+		return err
+	}
+
+	return s.db.Close()
 }
 
 // DatabasePath at which this database writes files.
-func (kv *Store) DatabasePath() string {
-	return kv.databasePath
+func (s *Store) DatabasePath() string {
+	return s.databasePath
 }
 
 func createBuckets(tx *bolt.Tx, buckets ...[]byte) error {
@@ -161,5 +197,5 @@ func createBuckets(tx *bolt.Tx, buckets ...[]byte) error {
 
 // createBoltCollector returns a prometheus collector specifically configured for boltdb.
 func createBoltCollector(db *bolt.DB) prometheus.Collector {
-	return prombolt.New("boltDB", db)
+	return prombolt.New("boltDB", db, blockedBuckets...)
 }

@@ -4,29 +4,34 @@ package main
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"runtime"
 	runtimeDebug "runtime/debug"
 
 	gethlog "github.com/ethereum/go-ethereum/log"
 	golog "github.com/ipfs/go-log/v2"
 	joonix "github.com/joonix/log"
+	"github.com/prysmaticlabs/prysm/beacon-chain/db"
 	"github.com/prysmaticlabs/prysm/beacon-chain/flags"
 	"github.com/prysmaticlabs/prysm/beacon-chain/node"
 	"github.com/prysmaticlabs/prysm/shared/cmd"
 	"github.com/prysmaticlabs/prysm/shared/debug"
 	"github.com/prysmaticlabs/prysm/shared/featureconfig"
+	"github.com/prysmaticlabs/prysm/shared/fileutil"
+	"github.com/prysmaticlabs/prysm/shared/journald"
 	"github.com/prysmaticlabs/prysm/shared/logutil"
+	_ "github.com/prysmaticlabs/prysm/shared/maxprocs"
+	"github.com/prysmaticlabs/prysm/shared/tos"
 	"github.com/prysmaticlabs/prysm/shared/version"
 	"github.com/sirupsen/logrus"
 	"github.com/urfave/cli/v2"
-	"github.com/urfave/cli/v2/altsrc"
 	prefixed "github.com/x-cray/logrus-prefixed-formatter"
-	_ "go.uber.org/automaxprocs"
 )
 
 var appFlags = []cli.Flag{
 	flags.DepositContractFlag,
 	flags.HTTPWeb3ProviderFlag,
+	flags.FallbackWeb3ProviderFlag,
 	flags.RPCHost,
 	flags.RPCPort,
 	flags.CertFlag,
@@ -34,12 +39,12 @@ var appFlags = []cli.Flag{
 	flags.DisableGRPCGateway,
 	flags.GRPCGatewayHost,
 	flags.GRPCGatewayPort,
+	flags.GPRCGatewayCorsDomain,
 	flags.MinSyncPeers,
 	flags.ContractDeploymentBlock,
 	flags.SetGCPercent,
-	flags.UnsafeSync,
-	flags.SlasherCertFlag,
-	flags.SlasherProviderFlag,
+	flags.HeadSync,
+	flags.DisableSync,
 	flags.DisableDiscv5,
 	flags.BlockBatchLimit,
 	flags.BlockBatchLimitBurstFactor,
@@ -49,9 +54,16 @@ var appFlags = []cli.Flag{
 	flags.InteropGenesisTimeFlag,
 	flags.SlotsPerArchivedPoint,
 	flags.EnableDebugRPCEndpoints,
+	flags.SubscribeToAllSubnets,
+	flags.HistoricalSlasherNode,
+	flags.ChainID,
+	flags.NetworkID,
+	flags.WeakSubjectivityCheckpt,
+	flags.Eth1HeaderReqLimit,
+	cmd.EnableBackupWebhookFlag,
+	cmd.BackupWebhookOutputDir,
 	cmd.MinimalConfigFlag,
 	cmd.E2EConfigFlag,
-	cmd.CustomGenesisDelayFlag,
 	cmd.RPCMaxPageSizeFlag,
 	cmd.BootstrapNode,
 	cmd.NoDiscovery,
@@ -86,11 +98,17 @@ var appFlags = []cli.Flag{
 	debug.MemProfileRateFlag,
 	debug.CPUProfileFlag,
 	debug.TraceFlag,
+	debug.BlockProfileRateFlag,
+	debug.MutexProfileFractionFlag,
 	cmd.LogFileName,
 	cmd.EnableUPnPFlag,
 	cmd.ConfigFileFlag,
 	cmd.ChainConfigFileFlag,
 	cmd.GrpcMaxCallRecvMsgSizeFlag,
+	cmd.AcceptTosFlag,
+	cmd.RestoreSourceFileFlag,
+	cmd.RestoreTargetDirFlag,
+	cmd.BoltMMapInitialSizeFlag,
 }
 
 func init() {
@@ -98,21 +116,21 @@ func init() {
 }
 
 func main() {
-	log := logrus.WithField("prefix", "main")
 	app := cli.App{}
 	app.Name = "beacon-chain"
 	app.Usage = "this is a beacon chain implementation for Ethereum 2.0"
 	app.Action = startNode
-	app.Version = version.GetVersion()
+	app.Version = version.Version()
+	app.Commands = []*cli.Command{
+		db.DatabaseCommands,
+	}
 
 	app.Flags = appFlags
 
 	app.Before = func(ctx *cli.Context) error {
-		// Load any flags from file, if specified.
-		if ctx.IsSet(cmd.ConfigFileFlag.Name) {
-			if err := altsrc.InitInputSourceWithContext(appFlags, altsrc.NewYamlSourceFromFlagFunc(cmd.ConfigFileFlag.Name))(ctx); err != nil {
-				return err
-			}
+		// Load flags from config file, if specified.
+		if err := cmd.LoadFlagsFromConfig(ctx, app.Flags); err != nil {
+			return err
 		}
 
 		format := ctx.String(cmd.LogFormat.Name)
@@ -133,6 +151,10 @@ func main() {
 			logrus.SetFormatter(f)
 		case "json":
 			logrus.SetFormatter(&logrus.JSONFormatter{})
+		case "journald":
+			if err := journald.Enable(); err != nil {
+				return err
+			}
 		default:
 			return fmt.Errorf("unknown log format %s", format)
 		}
@@ -143,7 +165,12 @@ func main() {
 				log.WithError(err).Error("Failed to configuring logging to disk.")
 			}
 		}
-
+		if err := cmd.ExpandSingleEndpointIfFile(ctx, flags.HTTPWeb3ProviderFlag); err != nil {
+			return err
+		}
+		if err := cmd.ExpandWeb3EndpointsIfFile(ctx, flags.FallbackWeb3ProviderFlag); err != nil {
+			return err
+		}
 		if ctx.IsSet(flags.SetGCPercent.Name) {
 			runtimeDebug.SetGCPercent(ctx.Int(flags.SetGCPercent.Name))
 		}
@@ -160,11 +187,22 @@ func main() {
 
 	if err := app.Run(os.Args); err != nil {
 		log.Error(err.Error())
-		os.Exit(1)
 	}
 }
 
 func startNode(ctx *cli.Context) error {
+	// Fix data dir for Windows users.
+	outdatedDataDir := filepath.Join(fileutil.HomeDir(), "AppData", "Roaming", "Eth2")
+	currentDataDir := ctx.String(cmd.DataDirFlag.Name)
+	if err := cmd.FixDefaultDataDir(outdatedDataDir, currentDataDir); err != nil {
+		return err
+	}
+
+	// verify if ToS accepted
+	if err := tos.VerifyTosAcceptedOrPrompt(ctx); err != nil {
+		return err
+	}
+
 	verbosity := ctx.String(cmd.VerbosityFlag.Name)
 	level, err := logrus.ParseLevel(verbosity)
 	if err != nil {
@@ -180,7 +218,7 @@ func startNode(ctx *cli.Context) error {
 		gethlog.Root().SetHandler(glogger)
 	}
 
-	beacon, err := node.NewBeaconNode(ctx)
+	beacon, err := node.New(ctx)
 	if err != nil {
 		return err
 	}

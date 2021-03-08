@@ -8,37 +8,35 @@ import (
 	"io"
 
 	"github.com/ethereum/go-ethereum/common"
+	types "github.com/prysmaticlabs/eth2-types"
 	eth "github.com/prysmaticlabs/ethereumapis/eth/v1alpha1"
-	ethpb "github.com/prysmaticlabs/ethereumapis/eth/v1alpha1"
 	"github.com/prysmaticlabs/prysm/beacon-chain/db/filters"
 	"github.com/prysmaticlabs/prysm/beacon-chain/state"
 	"github.com/prysmaticlabs/prysm/proto/beacon/db"
 	ethereum_beacon_p2p_v1 "github.com/prysmaticlabs/prysm/proto/beacon/p2p/v1"
+	"github.com/prysmaticlabs/prysm/shared/backuputil"
 )
 
 // ReadOnlyDatabase defines a struct which only has read access to database methods.
 type ReadOnlyDatabase interface {
-	// Attestation related methods.
-	AttestationsByDataRoot(ctx context.Context, attDataRoot [32]byte) ([]*eth.Attestation, error)
-	Attestations(ctx context.Context, f *filters.QueryFilter) ([]*eth.Attestation, error)
-	HasAttestation(ctx context.Context, attDataRoot [32]byte) bool
 	// Block related methods.
 	Block(ctx context.Context, blockRoot [32]byte) (*eth.SignedBeaconBlock, error)
-	Blocks(ctx context.Context, f *filters.QueryFilter) ([]*eth.SignedBeaconBlock, error)
+	Blocks(ctx context.Context, f *filters.QueryFilter) ([]*eth.SignedBeaconBlock, [][32]byte, error)
 	BlockRoots(ctx context.Context, f *filters.QueryFilter) ([][32]byte, error)
+	BlocksBySlot(ctx context.Context, slot types.Slot) (bool, []*eth.SignedBeaconBlock, error)
+	BlockRootsBySlot(ctx context.Context, slot types.Slot) (bool, [][32]byte, error)
 	HasBlock(ctx context.Context, blockRoot [32]byte) bool
-	GenesisBlock(ctx context.Context) (*ethpb.SignedBeaconBlock, error)
+	GenesisBlock(ctx context.Context) (*eth.SignedBeaconBlock, error)
 	IsFinalizedBlock(ctx context.Context, blockRoot [32]byte) bool
-	HighestSlotBlocks(ctx context.Context) ([]*ethpb.SignedBeaconBlock, error)
-	HighestSlotBlocksBelow(ctx context.Context, slot uint64) ([]*ethpb.SignedBeaconBlock, error)
+	FinalizedChildBlock(ctx context.Context, blockRoot [32]byte) (*eth.SignedBeaconBlock, error)
+	HighestSlotBlocksBelow(ctx context.Context, slot types.Slot) ([]*eth.SignedBeaconBlock, error)
 	// State related methods.
 	State(ctx context.Context, blockRoot [32]byte) (*state.BeaconState, error)
 	GenesisState(ctx context.Context) (*state.BeaconState, error)
 	HasState(ctx context.Context, blockRoot [32]byte) bool
 	StateSummary(ctx context.Context, blockRoot [32]byte) (*ethereum_beacon_p2p_v1.StateSummary, error)
 	HasStateSummary(ctx context.Context, blockRoot [32]byte) bool
-	HighestSlotStates(ctx context.Context) ([]*state.BeaconState, error)
-	HighestSlotStatesBelow(ctx context.Context, slot uint64) ([]*state.BeaconState, error)
+	HighestSlotStatesBelow(ctx context.Context, slot types.Slot) ([]*state.BeaconState, error)
 	// Slashing operations.
 	ProposerSlashing(ctx context.Context, slashingRoot [32]byte) (*eth.ProposerSlashing, error)
 	AttesterSlashing(ctx context.Context, slashingRoot [32]byte) (*eth.AttesterSlashing, error)
@@ -50,15 +48,10 @@ type ReadOnlyDatabase interface {
 	// Checkpoint operations.
 	JustifiedCheckpoint(ctx context.Context) (*eth.Checkpoint, error)
 	FinalizedCheckpoint(ctx context.Context) (*eth.Checkpoint, error)
-	// Archival data handlers for storing/retrieving historical beacon node information.
-	ArchivedActiveValidatorChanges(ctx context.Context, epoch uint64) (*ethereum_beacon_p2p_v1.ArchivedActiveSetChanges, error)
-	ArchivedCommitteeInfo(ctx context.Context, epoch uint64) (*ethereum_beacon_p2p_v1.ArchivedCommitteeInfo, error)
-	ArchivedBalances(ctx context.Context, epoch uint64) ([]uint64, error)
-	ArchivedValidatorParticipation(ctx context.Context, epoch uint64) (*eth.ValidatorParticipation, error)
-	ArchivedPointRoot(ctx context.Context, index uint64) [32]byte
-	HasArchivedPoint(ctx context.Context, index uint64) bool
-	LastArchivedIndexRoot(ctx context.Context) [32]byte
-	LastArchivedIndex(ctx context.Context) (uint64, error)
+	ArchivedPointRoot(ctx context.Context, slot types.Slot) [32]byte
+	HasArchivedPoint(ctx context.Context, slot types.Slot) bool
+	LastArchivedRoot(ctx context.Context) [32]byte
+	LastArchivedSlot(ctx context.Context) (types.Slot, error)
 	// Deposit contract related handlers.
 	DepositContractAddress(ctx context.Context) ([]byte, error)
 	// Powchain operations.
@@ -69,11 +62,6 @@ type ReadOnlyDatabase interface {
 type NoHeadAccessDatabase interface {
 	ReadOnlyDatabase
 
-	// Attestation related methods.
-	DeleteAttestation(ctx context.Context, attDataRoot [32]byte) error
-	DeleteAttestations(ctx context.Context, attDataRoots [][32]byte) error
-	SaveAttestation(ctx context.Context, att *eth.Attestation) error
-	SaveAttestations(ctx context.Context, atts []*eth.Attestation) error
 	// Block related methods.
 	SaveBlock(ctx context.Context, block *eth.SignedBeaconBlock) error
 	SaveBlocks(ctx context.Context, blocks []*eth.SignedBeaconBlock) error
@@ -93,17 +81,15 @@ type NoHeadAccessDatabase interface {
 	// Checkpoint operations.
 	SaveJustifiedCheckpoint(ctx context.Context, checkpoint *eth.Checkpoint) error
 	SaveFinalizedCheckpoint(ctx context.Context, checkpoint *eth.Checkpoint) error
-	// Archival data handlers for storing/retrieving historical beacon node information.
-	SaveArchivedActiveValidatorChanges(ctx context.Context, epoch uint64, changes *ethereum_beacon_p2p_v1.ArchivedActiveSetChanges) error
-	SaveArchivedCommitteeInfo(ctx context.Context, epoch uint64, info *ethereum_beacon_p2p_v1.ArchivedCommitteeInfo) error
-	SaveArchivedBalances(ctx context.Context, epoch uint64, balances []uint64) error
-	SaveArchivedValidatorParticipation(ctx context.Context, epoch uint64, part *eth.ValidatorParticipation) error
-	SaveArchivedPointRoot(ctx context.Context, blockRoot [32]byte, index uint64) error
-	SaveLastArchivedIndex(ctx context.Context, index uint64) error
 	// Deposit contract related handlers.
 	SaveDepositContractAddress(ctx context.Context, addr common.Address) error
 	// Powchain operations.
 	SavePowchainData(ctx context.Context, data *db.ETH1ChainData) error
+
+	// Run any required database migrations.
+	RunMigrations(ctx context.Context) error
+
+	CleanUpDirtyStates(ctx context.Context, slotsPerArchivedPoint types.Slot) error
 }
 
 // HeadAccessDatabase defines a struct with access to reading chain head data.
@@ -113,21 +99,14 @@ type HeadAccessDatabase interface {
 	// Block related methods.
 	HeadBlock(ctx context.Context) (*eth.SignedBeaconBlock, error)
 	SaveHeadBlockRoot(ctx context.Context, blockRoot [32]byte) error
-	// State related methods.
-	HeadState(ctx context.Context) (*state.BeaconState, error)
 }
 
 // Database interface with full access.
 type Database interface {
 	io.Closer
+	backuputil.BackupExporter
 	HeadAccessDatabase
 
 	DatabasePath() string
 	ClearDB() error
-
-	// Backup and restore methods
-	Backup(ctx context.Context) error
-
-	// HistoricalStatesDeleted verifies historical states exist in DB.
-	HistoricalStatesDeleted(ctx context.Context) error
 }

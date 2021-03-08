@@ -1,9 +1,10 @@
 package p2p
 
 import (
+	"bytes"
 	"crypto/ecdsa"
-	"fmt"
 	"net"
+	"time"
 
 	"github.com/ethereum/go-ethereum/p2p/discover"
 	"github.com/ethereum/go-ethereum/p2p/enode"
@@ -13,6 +14,8 @@ import (
 	"github.com/libp2p/go-libp2p-core/peer"
 	ma "github.com/multiformats/go-multiaddr"
 	"github.com/pkg/errors"
+	"github.com/prysmaticlabs/go-bitfield"
+	"github.com/prysmaticlabs/prysm/beacon-chain/cache"
 )
 
 // Listener defines the discovery V5 network interface that is used
@@ -28,25 +31,105 @@ type Listener interface {
 	LocalNode() *enode.LocalNode
 }
 
+// RefreshENR uses an epoch to refresh the enr entry for our node
+// with the tracked committee ids for the epoch, allowing our node
+// to be dynamically discoverable by others given our tracked committee ids.
+func (s *Service) RefreshENR() {
+	// return early if discv5 isnt running
+	if s.dv5Listener == nil {
+		return
+	}
+	bitV := bitfield.NewBitvector64()
+	committees := cache.SubnetIDs.GetAllSubnets()
+	for _, idx := range committees {
+		bitV.SetBitAt(idx, true)
+	}
+	currentBitV, err := bitvector(s.dv5Listener.Self().Record())
+	if err != nil {
+		log.Errorf("Could not retrieve bitfield: %v", err)
+		return
+	}
+	if bytes.Equal(bitV, currentBitV) {
+		// return early if bitfield hasn't changed
+		return
+	}
+	s.updateSubnetRecordWithMetadata(bitV)
+	// ping all peers to inform them of new metadata
+	s.pingPeers()
+}
+
+// listen for new nodes watches for new nodes in the network and adds them to the peerstore.
+func (s *Service) listenForNewNodes() {
+	iterator := s.dv5Listener.RandomNodes()
+	iterator = enode.Filter(iterator, s.filterPeer)
+	defer iterator.Close()
+	for {
+		// Exit if service's context is canceled
+		if s.ctx.Err() != nil {
+			break
+		}
+		if s.isPeerAtLimit(false /* inbound */) {
+			// Pause the main loop for a period to stop looking
+			// for new peers.
+			log.Trace("Not looking for peers, at peer limit")
+			time.Sleep(pollingPeriod)
+			continue
+		}
+		exists := iterator.Next()
+		if !exists {
+			break
+		}
+		node := iterator.Node()
+		peerInfo, _, err := convertToAddrInfo(node)
+		if err != nil {
+			log.WithError(err).Error("Could not convert to peer info")
+			continue
+		}
+		go func(info *peer.AddrInfo) {
+			if err := s.connectWithPeer(s.ctx, *info); err != nil {
+				log.WithError(err).Tracef("Could not connect with peer %s", info.String())
+			}
+		}(peerInfo)
+	}
+}
+
 func (s *Service) createListener(
 	ipAddr net.IP,
 	privKey *ecdsa.PrivateKey,
-) *discover.UDPv5 {
+) (*discover.UDPv5, error) {
+	// BindIP is used to specify the ip
+	// on which we will bind our listener on
+	// by default we will listen to all interfaces.
+	var bindIP net.IP
+	switch udpVersionFromIP(ipAddr) {
+	case "udp4":
+		bindIP = net.IPv4zero
+	case "udp6":
+		bindIP = net.IPv6zero
+	default:
+		return nil, errors.New("invalid ip provided")
+	}
+
+	// If local ip is specified then use that instead.
+	if s.cfg.LocalIP != "" {
+		ipAddr = net.ParseIP(s.cfg.LocalIP)
+		if ipAddr == nil {
+			return nil, errors.New("invalid local ip provided")
+		}
+		bindIP = ipAddr
+	}
 	udpAddr := &net.UDPAddr{
-		IP:   ipAddr,
+		IP:   bindIP,
 		Port: int(s.cfg.UDPPort),
 	}
-	// assume ip is either ipv4 or ipv6
-	networkVersion := ""
-	if ipAddr.To4() != nil {
-		networkVersion = "udp4"
-	} else {
-		networkVersion = "udp6"
-	}
+	// Listen to all network interfaces
+	// for both ip protocols.
+	networkVersion := "udp"
 	conn, err := net.ListenUDP(networkVersion, udpAddr)
 	if err != nil {
-		log.Fatal(err)
+		return nil, errors.Wrap(err, "could not listen to UDP")
 	}
+
 	localNode, err := s.createLocalNode(
 		privKey,
 		ipAddr,
@@ -54,7 +137,7 @@ func (s *Service) createListener(
 		int(s.cfg.TCPPort),
 	)
 	if err != nil {
-		log.Fatal(err)
+		return nil, errors.Wrap(err, "could not create local node")
 	}
 	if s.cfg.HostAddress != "" {
 		hostIP := net.ParseIP(s.cfg.HostAddress)
@@ -65,6 +148,19 @@ func (s *Service) createListener(
 			localNode.SetStaticIP(hostIP)
 		}
 	}
+	if s.cfg.HostDNS != "" {
+		host := s.cfg.HostDNS
+		ips, err := net.LookupIP(host)
+		if err != nil {
+			return nil, errors.Wrap(err, "could not resolve host address")
+		}
+		if len(ips) > 0 {
+			// Use first IP returned from the
+			// resolver.
+			firstIP := ips[0]
+			localNode.SetFallbackIP(firstIP)
+		}
+	}
 	dv5Cfg := discover.Config{
 		PrivateKey: privKey,
 	}
@@ -72,29 +168,29 @@ func (s *Service) createListener(
 	for _, addr := range s.cfg.Discv5BootStrapAddr {
 		bootNode, err := enode.Parse(enode.ValidSchemes, addr)
 		if err != nil {
-			log.Fatal(err)
+			return nil, errors.Wrap(err, "could not bootstrap addr")
 		}
 		dv5Cfg.Bootnodes = append(dv5Cfg.Bootnodes, bootNode)
 	}
 
-	network, err := discover.ListenV5(conn, localNode, dv5Cfg)
+	listener, err := discover.ListenV5(conn, localNode, dv5Cfg)
 	if err != nil {
-		log.Fatal(err)
+		return nil, errors.Wrap(err, "could not listen to discV5")
 	}
-	return network
+	return listener, nil
 }
 
 func (s *Service) createLocalNode(
 	privKey *ecdsa.PrivateKey,
 	ipAddr net.IP,
-	udpPort int,
-	tcpPort int,
+	udpPort, tcpPort int,
 ) (*enode.LocalNode, error) {
 	db, err := enode.OpenDB("")
 	if err != nil {
 		return nil, errors.Wrap(err, "could not open node's peer database")
 	}
 	localNode := enode.NewLocalNode(db, privKey)
+
 	ipEntry := enr.IP(ipAddr)
 	udpEntry := enr.UDP(udpPort)
 	tcpEntry := enr.TCP(tcpPort)
@@ -115,7 +211,10 @@ func (s *Service) startDiscoveryV5(
 	addr net.IP,
 	privKey *ecdsa.PrivateKey,
 ) (*discover.UDPv5, error) {
-	listener := s.createListener(addr, privKey)
+	listener, err := s.createListener(addr, privKey)
+	if err != nil {
+		return nil, errors.Wrap(err, "could not create listener")
+	}
 	record := listener.Self()
 	log.WithField("ENR", record.String()).Info("Started discovery v5")
 	return listener, nil
@@ -129,9 +228,14 @@ func (s *Service) startDiscoveryV5(
 // 2) Peer has a valid IP and TCP port set in their enr.
 // 3) Peer hasn't been marked as 'bad'
 // 4) Peer is not currently active or connected.
-// 5) Peer's fork digest in their ENR matches that of
+// 5) Peer is ready to receive incoming connections.
+// 6) Peer's fork digest in their ENR matches that of
 // 	  our localnodes.
 func (s *Service) filterPeer(node *enode.Node) bool {
+	// Ignore nil node entries passed in.
+	if node == nil {
+		return false
+	}
 	// ignore nodes with no ip address stored.
 	if node.IP() == nil {
 		return false
@@ -157,6 +261,9 @@ func (s *Service) filterPeer(node *enode.Node) bool {
 	if s.host.Network().Connectedness(peerData.ID) == network.Connected {
 		return false
 	}
+	if !s.peers.IsReadyToDial(peerData.ID) {
+		return false
+	}
 	nodeENR := node.Record()
 	// Decide whether or not to connect to peer that does not
 	// match the proper fork ENR data with our local node.
@@ -174,11 +281,21 @@ func (s *Service) filterPeer(node *enode.Node) bool {
 // This checks our set max peers in our config, and
 // determines whether our currently connected and
 // active peers are above our set max peer limit.
-func (s *Service) isPeerAtLimit() bool {
+func (s *Service) isPeerAtLimit(inbound bool) bool {
 	numOfConns := len(s.host.Network().Peers())
 	maxPeers := int(s.cfg.MaxPeers)
+	// If we are measuring the limit for inbound peers
+	// we apply the high watermark buffer.
+	if inbound {
+		maxPeers += highWatermarkBuffer
+		maxInbound := s.peers.InboundLimit() + highWatermarkBuffer
+		currInbound := len(s.peers.InboundConnected())
+		// Exit early if we are at the inbound limit.
+		if currInbound >= maxInbound {
+			return true
+		}
+	}
 	activePeers := len(s.Peers().Active())
-
 	return activePeers >= maxPeers || numOfConns >= maxPeers
 }
 
@@ -190,7 +307,7 @@ func parseBootStrapAddrs(addrs []string) (discv5Nodes []string) {
 	return discv5Nodes
 }
 
-func parseGenericAddrs(addrs []string) (enodeString []string, multiAddrString []string) {
+func parseGenericAddrs(addrs []string) (enodeString, multiAddrString []string) {
 	for _, addr := range addrs {
 		if addr == "" {
 			// Ignore empty entries
@@ -241,22 +358,42 @@ func convertToAddrInfo(node *enode.Node) (*peer.AddrInfo, ma.Multiaddr, error) {
 }
 
 func convertToSingleMultiAddr(node *enode.Node) (ma.Multiaddr, error) {
-	ip4 := node.IP().To4()
-	if ip4 == nil {
-		return nil, errors.Errorf("node doesn't have an ip4 address, it's stated IP is %s", node.IP().String())
-	}
 	pubkey := node.Pubkey()
 	assertedKey := convertToInterfacePubkey(pubkey)
 	id, err := peer.IDFromPublicKey(assertedKey)
 	if err != nil {
 		return nil, errors.Wrap(err, "could not get peer id")
 	}
-	multiAddrString := fmt.Sprintf("/ip4/%s/tcp/%d/p2p/%s", ip4.String(), node.TCP(), id)
-	multiAddr, err := ma.NewMultiaddr(multiAddrString)
+	return multiAddressBuilderWithID(node.IP().String(), "tcp", uint(node.TCP()), id)
+}
+
+func convertToUdpMultiAddr(node *enode.Node) ([]ma.Multiaddr, error) {
+	pubkey := node.Pubkey()
+	assertedKey := convertToInterfacePubkey(pubkey)
+	id, err := peer.IDFromPublicKey(assertedKey)
 	if err != nil {
-		return nil, errors.Wrap(err, "could not get multiaddr")
+		return nil, errors.Wrap(err, "could not get peer id")
 	}
-	return multiAddr, nil
+
+	var addresses []ma.Multiaddr
+	var ip4 enr.IPv4
+	var ip6 enr.IPv6
+	if node.Load(&ip4) == nil {
+		address, ipErr := multiAddressBuilderWithID(net.IP(ip4).String(), "udp", uint(node.UDP()), id)
+		if ipErr != nil {
+			return nil, errors.Wrap(ipErr, "could not build IPv4 address")
+		}
+		addresses = append(addresses, address)
+	}
+	if node.Load(&ip6) == nil {
+		address, ipErr := multiAddressBuilderWithID(net.IP(ip6).String(), "udp", uint(node.UDP()), id)
+		if ipErr != nil {
+			return nil, errors.Wrap(ipErr, "could not build IPv6 address")
+		}
+		addresses = append(addresses, address)
+	}
+
+	return addresses, nil
 }
 
 func peersFromStringAddrs(addrs []string) ([]ma.Multiaddr, error) {
@@ -289,4 +426,11 @@ func multiAddrFromString(address string) (ma.Multiaddr, error) {
 		return nil, err
 	}
 	return addr.Multiaddr(), nil
+}
+
+func udpVersionFromIP(ipAddr net.IP) string {
+	if ipAddr.To4() != nil {
+		return "udp4"
+	}
+	return "udp6"
 }

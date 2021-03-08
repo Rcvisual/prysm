@@ -4,19 +4,22 @@ import (
 	"context"
 	"testing"
 
+	types "github.com/prysmaticlabs/eth2-types"
 	ethpb "github.com/prysmaticlabs/ethereumapis/eth/v1alpha1"
 	"github.com/prysmaticlabs/prysm/beacon-chain/core/blocks"
 	"github.com/prysmaticlabs/prysm/beacon-chain/core/helpers"
 	"github.com/prysmaticlabs/prysm/shared/bls"
 	"github.com/prysmaticlabs/prysm/shared/params"
 	"github.com/prysmaticlabs/prysm/shared/testutil"
+	"github.com/prysmaticlabs/prysm/shared/testutil/assert"
+	"github.com/prysmaticlabs/prysm/shared/testutil/require"
 )
 
 func TestProcessAttesterSlashings_RegressionSlashableIndices(t *testing.T) {
 	testutil.ResetCache()
 	beaconState, privKeys := testutil.DeterministicGenesisState(t, 5500)
 	for _, vv := range beaconState.Validators() {
-		vv.WithdrawableEpoch = 1 * params.BeaconConfig().SlotsPerEpoch
+		vv.WithdrawableEpoch = types.Epoch(params.BeaconConfig().SlotsPerEpoch)
 	}
 	// This set of indices is very similar to the one from our sapphire testnet
 	// when close to 100 validators were incorrectly slashed. The set is from 0 -5500,
@@ -36,47 +39,39 @@ func TestProcessAttesterSlashings_RegressionSlashableIndices(t *testing.T) {
 
 	root1 := [32]byte{'d', 'o', 'u', 'b', 'l', 'e', '1'}
 	att1 := &ethpb.IndexedAttestation{
-		Data: &ethpb.AttestationData{
-			Source: &ethpb.Checkpoint{Epoch: 0},
-			Target: &ethpb.Checkpoint{Epoch: 0, Root: root1[:]},
-		},
+		Data:             testutil.HydrateAttestationData(&ethpb.AttestationData{Target: &ethpb.Checkpoint{Epoch: 0, Root: root1[:]}}),
 		AttestingIndices: setA,
+		Signature:        make([]byte, 96),
 	}
 	domain, err := helpers.Domain(beaconState.Fork(), 0, params.BeaconConfig().DomainBeaconAttester, beaconState.GenesisValidatorRoot())
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	signingRoot, err := helpers.ComputeSigningRoot(att1.Data, domain)
-	if err != nil {
-		t.Errorf("Could not get signing root of beacon block header: %v", err)
-	}
-	aggSigs := []bls.Signature{}
+	require.NoError(t, err, "Could not get signing root of beacon block header")
+	var aggSigs []bls.Signature
 	for _, index := range setA {
 		sig := privKeys[index].Sign(signingRoot[:])
 		aggSigs = append(aggSigs, sig)
 	}
 	aggregateSig := bls.AggregateSignatures(aggSigs)
-	att1.Signature = aggregateSig.Marshal()[:]
+	att1.Signature = aggregateSig.Marshal()
 
 	root2 := [32]byte{'d', 'o', 'u', 'b', 'l', 'e', '2'}
 	att2 := &ethpb.IndexedAttestation{
-		Data: &ethpb.AttestationData{
-			Source: &ethpb.Checkpoint{Epoch: 0},
-			Target: &ethpb.Checkpoint{Epoch: 0, Root: root2[:]},
-		},
+		Data: testutil.HydrateAttestationData(&ethpb.AttestationData{
+			Target: &ethpb.Checkpoint{Root: root2[:]},
+		}),
 		AttestingIndices: setB,
+		Signature:        make([]byte, 96),
 	}
 	signingRoot, err = helpers.ComputeSigningRoot(att2.Data, domain)
-	if err != nil {
-		t.Errorf("Could not get signing root of beacon block header: %v", err)
-	}
+	assert.NoError(t, err, "Could not get signing root of beacon block header")
 	aggSigs = []bls.Signature{}
 	for _, index := range setB {
 		sig := privKeys[index].Sign(signingRoot[:])
 		aggSigs = append(aggSigs, sig)
 	}
 	aggregateSig = bls.AggregateSignatures(aggSigs)
-	att2.Signature = aggregateSig.Marshal()[:]
+	att2.Signature = aggregateSig.Marshal()
 
 	slashings := []*ethpb.AttesterSlashing{
 		{
@@ -86,20 +81,17 @@ func TestProcessAttesterSlashings_RegressionSlashableIndices(t *testing.T) {
 	}
 
 	currentSlot := 2 * params.BeaconConfig().SlotsPerEpoch
-	if err := beaconState.SetSlot(currentSlot); err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, beaconState.SetSlot(currentSlot))
 
-	block := &ethpb.BeaconBlock{
+	b := testutil.NewBeaconBlock()
+	b.Block = &ethpb.BeaconBlock{
 		Body: &ethpb.BeaconBlockBody{
 			AttesterSlashings: slashings,
 		},
 	}
 
-	newState, err := blocks.ProcessAttesterSlashings(context.Background(), beaconState, block.Body)
-	if err != nil {
-		t.Fatal(err)
-	}
+	newState, err := blocks.ProcessAttesterSlashings(context.Background(), beaconState, b)
+	require.NoError(t, err)
 	newRegistry := newState.Validators()
 	if !newRegistry[expectedSlashedVal].Slashed {
 		t.Errorf("Validator with index %d was not slashed despite performing a double vote", expectedSlashedVal)

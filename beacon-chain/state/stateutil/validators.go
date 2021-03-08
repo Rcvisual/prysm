@@ -64,7 +64,7 @@ func ValidatorBalancesRoot(balances []uint64) ([32]byte, error) {
 // ValidatorRoot describes a method from which the hash tree root
 // of a validator is returned.
 func ValidatorRoot(hasher htrutils.HashFn, validator *ethpb.Validator) ([32]byte, error) {
-	fieldRoots := [][32]byte{}
+	var fieldRoots [][32]byte
 	if validator != nil {
 		pubkey := bytesutil.ToBytes48(validator.PublicKey)
 		withdrawCreds := bytesutil.ToBytes32(validator.WithdrawalCredentials)
@@ -78,16 +78,16 @@ func ValidatorRoot(hasher htrutils.HashFn, validator *ethpb.Validator) ([32]byte
 			slashBuf[0] = uint8(0)
 		}
 		activationEligibilityBuf := [32]byte{}
-		binary.LittleEndian.PutUint64(activationEligibilityBuf[:8], validator.ActivationEligibilityEpoch)
+		binary.LittleEndian.PutUint64(activationEligibilityBuf[:8], uint64(validator.ActivationEligibilityEpoch))
 
 		activationBuf := [32]byte{}
-		binary.LittleEndian.PutUint64(activationBuf[:8], validator.ActivationEpoch)
+		binary.LittleEndian.PutUint64(activationBuf[:8], uint64(validator.ActivationEpoch))
 
 		exitBuf := [32]byte{}
-		binary.LittleEndian.PutUint64(exitBuf[:8], validator.ExitEpoch)
+		binary.LittleEndian.PutUint64(exitBuf[:8], uint64(validator.ExitEpoch))
 
 		withdrawalBuf := [32]byte{}
-		binary.LittleEndian.PutUint64(withdrawalBuf[:8], validator.WithdrawableEpoch)
+		binary.LittleEndian.PutUint64(withdrawalBuf[:8], uint64(validator.WithdrawableEpoch))
 
 		// Public key.
 		pubKeyChunks, err := htrutils.Pack([][]byte{pubkey[:]})
@@ -164,19 +164,19 @@ func (h *stateRootHasher) validatorRoot(hasher htrutils.HashFn, validator *ethpb
 			enc[88] = uint8(0)
 		}
 		activationEligibilityBuf := [32]byte{}
-		binary.LittleEndian.PutUint64(activationEligibilityBuf[:8], validator.ActivationEligibilityEpoch)
+		binary.LittleEndian.PutUint64(activationEligibilityBuf[:8], uint64(validator.ActivationEligibilityEpoch))
 		copy(enc[89:97], activationEligibilityBuf[:8])
 
 		activationBuf := [32]byte{}
-		binary.LittleEndian.PutUint64(activationBuf[:8], validator.ActivationEpoch)
+		binary.LittleEndian.PutUint64(activationBuf[:8], uint64(validator.ActivationEpoch))
 		copy(enc[97:105], activationBuf[:8])
 
 		exitBuf := [32]byte{}
-		binary.LittleEndian.PutUint64(exitBuf[:8], validator.ExitEpoch)
+		binary.LittleEndian.PutUint64(exitBuf[:8], uint64(validator.ExitEpoch))
 		copy(enc[105:113], exitBuf[:8])
 
 		withdrawalBuf := [32]byte{}
-		binary.LittleEndian.PutUint64(withdrawalBuf[:8], validator.WithdrawableEpoch)
+		binary.LittleEndian.PutUint64(withdrawalBuf[:8], uint64(validator.WithdrawableEpoch))
 		copy(enc[113:121], withdrawalBuf[:8])
 
 		// Check if it exists in cache:
@@ -210,19 +210,14 @@ func (h *stateRootHasher) validatorRoot(hasher htrutils.HashFn, validator *ethpb
 		} else {
 			slashBuf[0] = uint8(0)
 		}
-		fieldRoots = append(fieldRoots, slashBuf)
-
-		// Activation eligibility epoch.
-		fieldRoots = append(fieldRoots, activationEligibilityBuf)
-
-		// Activation epoch.
-		fieldRoots = append(fieldRoots, activationBuf)
-
-		// Exit epoch.
-		fieldRoots = append(fieldRoots, exitBuf)
-
-		// Withdrawable epoch.
-		fieldRoots = append(fieldRoots, withdrawalBuf)
+		fieldRoots = append(
+			fieldRoots,
+			slashBuf,
+			activationEligibilityBuf,
+			activationBuf,
+			exitBuf,
+			withdrawalBuf,
+		)
 	}
 
 	valRoot, err := htrutils.BitwiseMerkleizeArrays(hasher, fieldRoots, uint64(len(fieldRoots)), uint64(len(fieldRoots)))

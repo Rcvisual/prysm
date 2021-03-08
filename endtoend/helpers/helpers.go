@@ -8,8 +8,10 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"net/http"
 	"os"
 	"path"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -21,30 +23,20 @@ import (
 const (
 	maxPollingWaitTime  = 60 * time.Second // A minute so timing out doesn't take very long.
 	filePollingInterval = 500 * time.Millisecond
+	memoryHeapFileName  = "node_heap_%d.pb.gz"
+	cpuProfileFileName  = "node_cpu_profile_%d.pb.gz"
+	fileBufferSize      = 64 * 1024
+	maxFileBufferSize   = 1024 * 1024
 )
 
-// KillProcesses finds the passed in process IDs and kills the process.
-func KillProcesses(t *testing.T, pIDs []int) {
-	for _, id := range pIDs {
-		process, err := os.FindProcess(id)
-		if err != nil {
-			t.Fatalf("Could not find process %d: %v", id, err)
-		}
-		if err := process.Kill(); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := process.Wait(); err != nil {
-			t.Fatal(err)
-		}
-	}
-}
+var Graffiti = []string{"Sushi", "Ramen", "Takoyaki"}
 
 // DeleteAndCreateFile checks if the file path given exists, if it does, it deletes it and creates a new file.
 // If not, it just creates the requested file.
-func DeleteAndCreateFile(tmpPath string, fileName string) (*os.File, error) {
+func DeleteAndCreateFile(tmpPath, fileName string) (*os.File, error) {
 	filePath := path.Join(tmpPath, fileName)
 	if _, err := os.Stat(filePath); os.IsExist(err) {
-		if err := os.Remove(filePath); err != nil {
+		if err = os.Remove(filePath); err != nil {
 			return nil, err
 		}
 	}
@@ -74,6 +66,8 @@ func WaitForTextInFile(file *os.File, text string) error {
 			return fmt.Errorf("could not find requested text \"%s\" in logs:\n%s", text, contents)
 		case <-ticker.C:
 			fileScanner := bufio.NewScanner(file)
+			buf := make([]byte, 0, fileBufferSize)
+			fileScanner.Buffer(buf, maxFileBufferSize)
 			for fileScanner.Scan() {
 				scanned := fileScanner.Text()
 				if strings.Contains(scanned, text) {
@@ -89,6 +83,20 @@ func WaitForTextInFile(file *os.File, text string) error {
 			}
 		}
 	}
+}
+
+func GraffitiYamlFile(testDir string) (string, error) {
+	b := []byte(`default: "Rice"
+random: 
+  - "Sushi"
+  - "Ramen"
+  - "Takoyaki"
+`)
+	f := filepath.Join(testDir, "graffiti.yaml")
+	if err := ioutil.WriteFile(f, b, os.ModePerm); err != nil {
+		return "", err
+	}
+	return f, nil
 }
 
 // LogOutput logs the output of all log files made.
@@ -134,12 +142,44 @@ func LogErrorOutput(t *testing.T, file io.Reader, title string, index int) {
 	}
 
 	t.Logf("==================== Start of %s %d error output ==================\n", title, index)
-	var lines uint64
 	for _, err := range errorLines {
-		lines++
-		if lines >= 10 {
-			break
-		}
 		t.Log(err)
 	}
+}
+
+// WritePprofFiles writes the memory heap and cpu profile files to the test path.
+func WritePprofFiles(testDir string, index int) error {
+	url := fmt.Sprintf("http://127.0.0.1:%d/debug/pprof/heap", e2e.TestParams.BeaconNodeRPCPort+50+index)
+	filePath := filepath.Join(testDir, fmt.Sprintf(memoryHeapFileName, index))
+	if err := writeURLRespAtPath(url, filePath); err != nil {
+		return err
+	}
+	url = fmt.Sprintf("http://127.0.0.1:%d/debug/pprof/profile", e2e.TestParams.BeaconNodeRPCPort+50+index)
+	filePath = filepath.Join(testDir, fmt.Sprintf(cpuProfileFileName, index))
+	return writeURLRespAtPath(url, filePath)
+}
+
+func writeURLRespAtPath(url, filePath string) error {
+	resp, err := http.Get(url)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err = resp.Body.Close(); err != nil {
+			return
+		}
+	}()
+
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+	file, err := os.Create(filePath)
+	if err != nil {
+		return err
+	}
+	if _, err = file.Write(body); err != nil {
+		return err
+	}
+	return nil
 }

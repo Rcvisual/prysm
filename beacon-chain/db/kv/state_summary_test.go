@@ -2,11 +2,13 @@ package kv
 
 import (
 	"context"
-	"reflect"
 	"testing"
 
+	types "github.com/prysmaticlabs/eth2-types"
 	pb "github.com/prysmaticlabs/prysm/proto/beacon/p2p/v1"
 	"github.com/prysmaticlabs/prysm/shared/bytesutil"
+	"github.com/prysmaticlabs/prysm/shared/testutil/assert"
+	"github.com/prysmaticlabs/prysm/shared/testutil/require"
 )
 
 func TestStateSummary_CanSaveRretrieve(t *testing.T) {
@@ -17,45 +19,46 @@ func TestStateSummary_CanSaveRretrieve(t *testing.T) {
 	s1 := &pb.StateSummary{Slot: 1, Root: r1[:]}
 
 	// State summary should not exist yet.
-	if db.HasStateSummary(ctx, r1) {
-		t.Fatal("State summary should not be saved")
-	}
-
-	if err := db.SaveStateSummary(ctx, s1); err != nil {
-		t.Fatal(err)
-	}
-	if !db.HasStateSummary(ctx, r1) {
-		t.Fatal("State summary should be saved")
-	}
+	require.Equal(t, false, db.HasStateSummary(ctx, r1), "State summary should not be saved")
+	require.NoError(t, db.SaveStateSummary(ctx, s1))
+	require.Equal(t, true, db.HasStateSummary(ctx, r1), "State summary should be saved")
 
 	saved, err := db.StateSummary(ctx, r1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !reflect.DeepEqual(saved, s1) {
-		t.Error("State summary does not equal")
-	}
+	require.NoError(t, err)
+	assert.DeepEqual(t, s1, saved, "State summary does not equal")
 
 	// Save a new state summary.
 	s2 := &pb.StateSummary{Slot: 2, Root: r2[:]}
 
 	// State summary should not exist yet.
-	if db.HasStateSummary(ctx, r2) {
-		t.Fatal("State summary should not be saved")
-	}
-
-	if err := db.SaveStateSummary(ctx, s2); err != nil {
-		t.Fatal(err)
-	}
-	if !db.HasStateSummary(ctx, r2) {
-		t.Fatal("State summary should be saved")
-	}
+	require.Equal(t, false, db.HasStateSummary(ctx, r2), "State summary should not be saved")
+	require.NoError(t, db.SaveStateSummary(ctx, s2))
+	require.Equal(t, true, db.HasStateSummary(ctx, r2), "State summary should be saved")
 
 	saved, err = db.StateSummary(ctx, r2)
-	if err != nil {
-		t.Fatal(err)
+	require.NoError(t, err)
+	assert.DeepEqual(t, s2, saved, "State summary does not equal")
+}
+
+func TestStateSummary_CacheToDB(t *testing.T) {
+	db := setupDB(t)
+
+	summaries := make([]*pb.StateSummary, stateSummaryCachePruneCount-1)
+	for i := range summaries {
+		summaries[i] = &pb.StateSummary{Slot: types.Slot(i), Root: bytesutil.PadTo(bytesutil.Uint64ToBytesLittleEndian(uint64(i)), 32)}
 	}
-	if !reflect.DeepEqual(saved, s2) {
-		t.Error("State summary does not equal")
+
+	require.NoError(t, db.SaveStateSummaries(context.Background(), summaries))
+	require.Equal(t, db.stateSummaryCache.len(), stateSummaryCachePruneCount-1)
+
+	require.NoError(t, db.SaveStateSummary(context.Background(), &pb.StateSummary{Slot: 1000, Root: []byte{'a', 'b'}}))
+	require.Equal(t, db.stateSummaryCache.len(), stateSummaryCachePruneCount)
+
+	require.NoError(t, db.SaveStateSummary(context.Background(), &pb.StateSummary{Slot: 1001, Root: []byte{'c', 'd'}}))
+	require.Equal(t, db.stateSummaryCache.len(), 1)
+
+	for i := range summaries {
+		r := bytesutil.Uint64ToBytesLittleEndian(uint64(i))
+		require.Equal(t, true, db.HasStateSummary(context.Background(), bytesutil.ToBytes32(r)))
 	}
 }

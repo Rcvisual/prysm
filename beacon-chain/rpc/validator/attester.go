@@ -2,9 +2,11 @@ package validator
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	ptypes "github.com/gogo/protobuf/types"
+	types "github.com/prysmaticlabs/eth2-types"
 	ethpb "github.com/prysmaticlabs/ethereumapis/eth/v1alpha1"
 	"github.com/prysmaticlabs/prysm/beacon-chain/cache"
 	"github.com/prysmaticlabs/prysm/beacon-chain/core/feed"
@@ -12,7 +14,6 @@ import (
 	"github.com/prysmaticlabs/prysm/beacon-chain/core/helpers"
 	"github.com/prysmaticlabs/prysm/beacon-chain/core/state"
 	stateTrie "github.com/prysmaticlabs/prysm/beacon-chain/state"
-	"github.com/prysmaticlabs/prysm/beacon-chain/state/stateutil"
 	"github.com/prysmaticlabs/prysm/shared/bls"
 	"github.com/prysmaticlabs/prysm/shared/bytesutil"
 	"github.com/prysmaticlabs/prysm/shared/featureconfig"
@@ -36,7 +37,7 @@ func (vs *Server) GetAttestationData(ctx context.Context, req *ethpb.Attestation
 		return nil, status.Errorf(codes.Unavailable, "Syncing to latest head, not ready to respond")
 	}
 
-	if err := helpers.ValidateAttestationTime(req.Slot, vs.GenesisTimeFetcher.GenesisTime()); err != nil {
+	if err := helpers.ValidateAttestationTime(req.Slot, vs.TimeFetcher.GenesisTime()); err != nil {
 		return nil, status.Error(codes.InvalidArgument, fmt.Sprintf("invalid request: %v", err))
 	}
 
@@ -45,14 +46,12 @@ func (vs *Server) GetAttestationData(ctx context.Context, req *ethpb.Attestation
 		return nil, status.Errorf(codes.Internal, "Could not retrieve data from attestation cache: %v", err)
 	}
 	if res != nil {
-		if featureconfig.Get().ReduceAttesterStateCopy {
-			res.CommitteeIndex = req.CommitteeIndex
-		}
+		res.CommitteeIndex = req.CommitteeIndex
 		return res, nil
 	}
 
 	if err := vs.AttestationCache.MarkInProgress(req); err != nil {
-		if err == cache.ErrAlreadyInProgress {
+		if errors.Is(err, cache.ErrAlreadyInProgress) {
 			res, err := vs.AttestationCache.Get(ctx, req)
 			if err != nil {
 				return nil, status.Errorf(codes.Internal, "Could not retrieve data from attestation cache: %v", err)
@@ -60,16 +59,14 @@ func (vs *Server) GetAttestationData(ctx context.Context, req *ethpb.Attestation
 			if res == nil {
 				return nil, status.Error(codes.DataLoss, "A request was in progress and resolved to nil")
 			}
-			if featureconfig.Get().ReduceAttesterStateCopy {
-				res.CommitteeIndex = req.CommitteeIndex
-			}
+			res.CommitteeIndex = req.CommitteeIndex
 			return res, nil
 		}
 		return nil, status.Errorf(codes.Internal, "Could not mark attestation as in-progress: %v", err)
 	}
 	defer func() {
 		if err := vs.AttestationCache.MarkNotInProgress(req); err != nil {
-			log.WithError(err).Error("Failed to mark cache not in progress")
+			log.WithError(err).Error("Could not mark cache not in progress")
 		}
 	}()
 
@@ -94,21 +91,31 @@ func (vs *Server) GetAttestationData(ctx context.Context, req *ethpb.Attestation
 		}
 	}
 	if headState == nil {
-		return nil, status.Error(codes.Internal, "Failed to lookup parent state from head.")
+		return nil, status.Error(codes.Internal, "Could not lookup parent state from head.")
 	}
 
 	if helpers.CurrentEpoch(headState) < helpers.SlotToEpoch(req.Slot) {
-		headState, err = state.ProcessSlots(ctx, headState, helpers.StartSlot(helpers.SlotToEpoch(req.Slot)))
-		if err != nil {
-			return nil, status.Errorf(codes.Internal, "Could not process slots up to %d: %v", req.Slot, err)
+		if featureconfig.Get().EnableNextSlotStateCache {
+			headState, err = state.ProcessSlotsUsingNextSlotCache(ctx, headState, headRoot, req.Slot)
+			if err != nil {
+				return nil, status.Errorf(codes.Internal, "Could not process slots up to %d: %v", req.Slot, err)
+			}
+		} else {
+			headState, err = state.ProcessSlots(ctx, headState, req.Slot)
+			if err != nil {
+				return nil, status.Errorf(codes.Internal, "Could not process slots up to %d: %v", req.Slot, err)
+			}
 		}
 	}
 
 	targetEpoch := helpers.CurrentEpoch(headState)
-	epochStartSlot := helpers.StartSlot(targetEpoch)
-	targetRoot := make([]byte, 32)
+	epochStartSlot, err := helpers.StartSlot(targetEpoch)
+	if err != nil {
+		return nil, err
+	}
+	var targetRoot []byte
 	if epochStartSlot == headState.Slot() {
-		targetRoot = headRoot[:]
+		targetRoot = headRoot
 	} else {
 		targetRoot, err = helpers.BlockRootAtSlot(headState, epochStartSlot)
 		if err != nil {
@@ -122,7 +129,7 @@ func (vs *Server) GetAttestationData(ctx context.Context, req *ethpb.Attestation
 	res = &ethpb.AttestationData{
 		Slot:            req.Slot,
 		CommitteeIndex:  req.CommitteeIndex,
-		BeaconBlockRoot: headRoot[:],
+		BeaconBlockRoot: headRoot,
 		Source:          headState.CurrentJustifiedCheckpoint(),
 		Target: &ethpb.Checkpoint{
 			Epoch: targetEpoch,
@@ -146,7 +153,7 @@ func (vs *Server) ProposeAttestation(ctx context.Context, att *ethpb.Attestation
 		return nil, status.Error(codes.InvalidArgument, "Incorrect attestation signature")
 	}
 
-	root, err := stateutil.AttestationDataRoot(att.Data)
+	root, err := att.Data.HashTreeRoot()
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "Could not tree hash attestation: %v", err)
 	}
@@ -199,7 +206,7 @@ func (vs *Server) SubscribeCommitteeSubnets(ctx context.Context, req *ethpb.Comm
 		return nil, status.Error(codes.InvalidArgument, "no attester slots provided")
 	}
 
-	fetchValsLen := func(slot uint64) (uint64, error) {
+	fetchValsLen := func(slot types.Slot) (uint64, error) {
 		wantedEpoch := helpers.SlotToEpoch(slot)
 		vals, err := vs.HeadFetcher.HeadValidatorsIndices(ctx, wantedEpoch)
 		if err != nil {
@@ -225,7 +232,7 @@ func (vs *Server) SubscribeCommitteeSubnets(ctx context.Context, req *ethpb.Comm
 			}
 			currEpoch = helpers.SlotToEpoch(req.Slots[i])
 		}
-		subnet := helpers.ComputeSubnetFromCommitteeAndSlot(currValsLen, req.CommitteeIds[i], req.Slots[i])
+		subnet := helpers.ComputeSubnetFromCommitteeAndSlot(currValsLen, types.CommitteeIndex(req.CommitteeIds[i]), req.Slots[i])
 		cache.SubnetIDs.AddAttesterSubnetID(req.Slots[i], subnet)
 		if req.IsAggregator[i] {
 			cache.SubnetIDs.AddAggregatorSubnetID(req.Slots[i], subnet)

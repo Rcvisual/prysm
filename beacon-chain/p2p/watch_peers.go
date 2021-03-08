@@ -2,12 +2,10 @@ package p2p
 
 import (
 	"context"
-	"time"
 
-	host "github.com/libp2p/go-libp2p-host"
+	"github.com/libp2p/go-libp2p-core/host"
+	"github.com/libp2p/go-libp2p-core/peer"
 )
-
-const timeoutMax = 30 * time.Second
 
 // ensurePeerConnections will attempt to reestablish connection to the peers
 // if there are currently no connections to that peer.
@@ -19,21 +17,25 @@ func ensurePeerConnections(ctx context.Context, h host.Host, peers ...string) {
 		if p == "" {
 			continue
 		}
-		peer, err := MakePeer(p)
+		peerInfo, err := MakePeer(p)
 		if err != nil {
 			log.Errorf("Could not make peer: %v", err)
 			continue
 		}
 
-		c := h.Network().ConnsToPeer(peer.ID)
+		c := h.Network().ConnsToPeer(peerInfo.ID)
 		if len(c) == 0 {
-			log.WithField("peer", peer.ID).Debug("No connections to peer, reconnecting")
-			ctx, cancel := context.WithTimeout(ctx, timeoutMax)
-			defer cancel()
-			if err := h.Connect(ctx, *peer); err != nil {
-				log.WithField("peer", peer.ID).WithField("addrs", peer.Addrs).WithError(err).Errorf("Failed to reconnect to peer")
+			if err := connectWithTimeout(ctx, h, peerInfo); err != nil {
+				log.WithField("peer", peerInfo.ID).WithField("addrs", peerInfo.Addrs).WithError(err).Errorf("Failed to reconnect to peer")
 				continue
 			}
 		}
 	}
+}
+
+func connectWithTimeout(ctx context.Context, h host.Host, peer *peer.AddrInfo) error {
+	log.WithField("peer", peer.ID).Debug("No connections to peer, reconnecting")
+	ctx, cancel := context.WithTimeout(ctx, maxDialTimeout)
+	defer cancel()
+	return h.Connect(ctx, *peer)
 }

@@ -1,15 +1,17 @@
 package testing
 
 import (
+	"context"
 	"sync"
 
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/p2p/enode"
 	"github.com/ethereum/go-ethereum/p2p/enr"
 	"github.com/libp2p/go-libp2p-core/network"
-	peer "github.com/libp2p/go-libp2p-peer"
+	"github.com/libp2p/go-libp2p-core/peer"
 	ma "github.com/multiformats/go-multiaddr"
 	"github.com/prysmaticlabs/prysm/beacon-chain/p2p/peers"
+	"github.com/prysmaticlabs/prysm/beacon-chain/p2p/peers/scorers"
 	pb "github.com/prysmaticlabs/prysm/proto/beacon/p2p/v1"
 	log "github.com/sirupsen/logrus"
 )
@@ -20,14 +22,35 @@ type MockPeersProvider struct {
 	peers *peers.Status
 }
 
+// ClearPeers removes all known peers.
+func (m *MockPeersProvider) ClearPeers() {
+	m.lock.Lock()
+	defer m.lock.Unlock()
+	m.peers = peers.NewStatus(context.Background(), &peers.StatusConfig{
+		PeerLimit: 30,
+		ScorerParams: &scorers.Config{
+			BadResponsesScorerConfig: &scorers.BadResponsesScorerConfig{
+				Threshold: 5,
+			},
+		},
+	})
+}
+
 // Peers provides access the peer status.
 func (m *MockPeersProvider) Peers() *peers.Status {
 	m.lock.Lock()
 	defer m.lock.Unlock()
 	if m.peers == nil {
-		m.peers = peers.NewStatus(5 /* maxBadResponses */)
+		m.peers = peers.NewStatus(context.Background(), &peers.StatusConfig{
+			PeerLimit: 30,
+			ScorerParams: &scorers.Config{
+				BadResponsesScorerConfig: &scorers.BadResponsesScorerConfig{
+					Threshold: 5,
+				},
+			},
+		})
 		// Pretend we are connected to two peers
-		id0, err := peer.IDB58Decode("16Uiu2HAkyWZ4Ni1TpvDS8dPxsozmHY85KaiFjodQuV6Tz5tkHVeR")
+		id0, err := peer.Decode("16Uiu2HAkyWZ4Ni1TpvDS8dPxsozmHY85KaiFjodQuV6Tz5tkHVeR")
 		if err != nil {
 			log.WithError(err).Debug("Cannot decode")
 		}
@@ -37,8 +60,8 @@ func (m *MockPeersProvider) Peers() *peers.Status {
 		}
 		m.peers.Add(createENR(), id0, ma0, network.DirInbound)
 		m.peers.SetConnectionState(id0, peers.PeerConnected)
-		m.peers.SetChainState(id0, &pb.Status{FinalizedEpoch: uint64(10)})
-		id1, err := peer.IDB58Decode("16Uiu2HAm4HgJ9N1o222xK61o7LSgToYWoAy1wNTJRkh9gLZapVAy")
+		m.peers.SetChainState(id0, &pb.Status{FinalizedEpoch: 10})
+		id1, err := peer.Decode("16Uiu2HAm4HgJ9N1o222xK61o7LSgToYWoAy1wNTJRkh9gLZapVAy")
 		if err != nil {
 			log.WithError(err).Debug("Cannot decode")
 		}
@@ -48,13 +71,16 @@ func (m *MockPeersProvider) Peers() *peers.Status {
 		}
 		m.peers.Add(createENR(), id1, ma1, network.DirOutbound)
 		m.peers.SetConnectionState(id1, peers.PeerConnected)
-		m.peers.SetChainState(id1, &pb.Status{FinalizedEpoch: uint64(11)})
+		m.peers.SetChainState(id1, &pb.Status{FinalizedEpoch: 11})
 	}
 	return m.peers
 }
 
 func createENR() *enr.Record {
 	key, err := crypto.GenerateKey()
+	if err != nil {
+		log.Error(err)
+	}
 	db, err := enode.OpenDB("")
 	if err != nil {
 		log.Error("could not open node's peer database")

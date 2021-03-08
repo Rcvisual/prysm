@@ -1,26 +1,27 @@
 package kv
 
 import (
-	"reflect"
 	"sort"
 	"testing"
 
 	ethpb "github.com/prysmaticlabs/ethereumapis/eth/v1alpha1"
 	"github.com/prysmaticlabs/go-bitfield"
+	"github.com/prysmaticlabs/prysm/shared/testutil"
+	"github.com/prysmaticlabs/prysm/shared/testutil/assert"
+	"github.com/prysmaticlabs/prysm/shared/testutil/require"
 )
 
 func TestKV_BlockAttestation_CanSaveRetrieve(t *testing.T) {
 	cache := NewAttCaches()
 
-	att1 := &ethpb.Attestation{Data: &ethpb.AttestationData{Slot: 1}, AggregationBits: bitfield.Bitlist{0b1101}}
-	att2 := &ethpb.Attestation{Data: &ethpb.AttestationData{Slot: 2}, AggregationBits: bitfield.Bitlist{0b1101}}
-	att3 := &ethpb.Attestation{Data: &ethpb.AttestationData{Slot: 3}, AggregationBits: bitfield.Bitlist{0b1101}}
-	atts := []*ethpb.Attestation{att1, att2, att3}
+	att1 := testutil.HydrateAttestation(&ethpb.Attestation{Data: &ethpb.AttestationData{Slot: 1}, AggregationBits: bitfield.Bitlist{0b1101}})
+	att2 := testutil.HydrateAttestation(&ethpb.Attestation{Data: &ethpb.AttestationData{Slot: 2}, AggregationBits: bitfield.Bitlist{0b1101}})
+	att3 := testutil.HydrateAttestation(&ethpb.Attestation{Data: &ethpb.AttestationData{Slot: 3}, AggregationBits: bitfield.Bitlist{0b1101}})
+	att4 := testutil.HydrateAttestation(&ethpb.Attestation{Data: &ethpb.AttestationData{Slot: 3}, AggregationBits: bitfield.Bitlist{0b11011}}) // Diff bit length should not panic.
+	atts := []*ethpb.Attestation{att1, att2, att3, att4}
 
 	for _, att := range atts {
-		if err := cache.SaveBlockAttestation(att); err != nil {
-			t.Fatal(err)
-		}
+		require.NoError(t, cache.SaveBlockAttestation(att))
 	}
 
 	returned := cache.BlockAttestations()
@@ -29,36 +30,25 @@ func TestKV_BlockAttestation_CanSaveRetrieve(t *testing.T) {
 		return returned[i].Data.Slot < returned[j].Data.Slot
 	})
 
-	if !reflect.DeepEqual(atts, returned) {
-		t.Error("Did not receive correct aggregated atts")
-	}
+	assert.DeepEqual(t, atts, returned)
 }
 
 func TestKV_BlockAttestation_CanDelete(t *testing.T) {
 	cache := NewAttCaches()
 
-	att1 := &ethpb.Attestation{Data: &ethpb.AttestationData{Slot: 1}, AggregationBits: bitfield.Bitlist{0b1101}}
-	att2 := &ethpb.Attestation{Data: &ethpb.AttestationData{Slot: 2}, AggregationBits: bitfield.Bitlist{0b1101}}
-	att3 := &ethpb.Attestation{Data: &ethpb.AttestationData{Slot: 3}, AggregationBits: bitfield.Bitlist{0b1101}}
+	att1 := testutil.HydrateAttestation(&ethpb.Attestation{Data: &ethpb.AttestationData{Slot: 1}, AggregationBits: bitfield.Bitlist{0b1101}})
+	att2 := testutil.HydrateAttestation(&ethpb.Attestation{Data: &ethpb.AttestationData{Slot: 2}, AggregationBits: bitfield.Bitlist{0b1101}})
+	att3 := testutil.HydrateAttestation(&ethpb.Attestation{Data: &ethpb.AttestationData{Slot: 3}, AggregationBits: bitfield.Bitlist{0b1101}})
 	atts := []*ethpb.Attestation{att1, att2, att3}
 
 	for _, att := range atts {
-		if err := cache.SaveBlockAttestation(att); err != nil {
-			t.Fatal(err)
-		}
+		require.NoError(t, cache.SaveBlockAttestation(att))
 	}
 
-	if err := cache.DeleteBlockAttestation(att1); err != nil {
-		t.Fatal(err)
-	}
-	if err := cache.DeleteBlockAttestation(att3); err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, cache.DeleteBlockAttestation(att1))
+	require.NoError(t, cache.DeleteBlockAttestation(att3))
 
 	returned := cache.BlockAttestations()
 	wanted := []*ethpb.Attestation{att2}
-
-	if !reflect.DeepEqual(wanted, returned) {
-		t.Error("Did not receive correct aggregated atts")
-	}
+	assert.DeepEqual(t, wanted, returned)
 }

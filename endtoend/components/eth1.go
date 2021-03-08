@@ -29,7 +29,7 @@ const timeGapPerTX = 100 * time.Millisecond
 const timeGapPerMiningTX = 250 * time.Millisecond
 
 // StartEth1Node starts an eth1 local dev chain and deploys a deposit contract.
-func StartEth1Node(t *testing.T) (string, int) {
+func StartEth1Node(t *testing.T) string {
 	binaryPath, found := bazel.FindBinary("cmd/geth", "geth")
 	if !found {
 		t.Fatal("go-ethereum binary not found")
@@ -38,7 +38,7 @@ func StartEth1Node(t *testing.T) (string, int) {
 	eth1Path := path.Join(e2e.TestParams.TestPath, "eth1data/")
 	// Clear out ETH1 to prevent issues.
 	if _, err := os.Stat(eth1Path); !os.IsNotExist(err) {
-		if err := os.RemoveAll(eth1Path); err != nil {
+		if err = os.RemoveAll(eth1Path); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -65,7 +65,7 @@ func StartEth1Node(t *testing.T) (string, int) {
 	}
 	cmd.Stdout = file
 	cmd.Stderr = file
-	if err := cmd.Start(); err != nil {
+	if err = cmd.Start(); err != nil {
 		t.Fatalf("Failed to start eth1 chain: %v", err)
 	}
 
@@ -90,13 +90,13 @@ func StartEth1Node(t *testing.T) (string, int) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	keystore, err := keystore.DecryptKey(jsonBytes, "" /*password*/)
+	store, err := keystore.DecryptKey(jsonBytes, "" /*password*/)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	// Advancing the blocks eth1follow distance to prevent issues reading the chain.
-	if err := mineBlocks(web3, keystore, params.BeaconConfig().Eth1FollowDistance); err != nil {
+	if err = mineBlocks(web3, store, params.BeaconConfig().Eth1FollowDistance); err != nil {
 		t.Fatalf("Unable to advance chain: %v", err)
 	}
 
@@ -104,7 +104,7 @@ func StartEth1Node(t *testing.T) (string, int) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	nonce, err := web3.PendingNonceAt(context.Background(), keystore.Address)
+	nonce, err := web3.PendingNonceAt(context.Background(), store.Address)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -124,11 +124,11 @@ func StartEth1Node(t *testing.T) (string, int) {
 	}
 
 	// Advancing the blocks another eth1follow distance to prevent issues reading the chain.
-	if err := mineBlocks(web3, keystore, params.BeaconConfig().Eth1FollowDistance); err != nil {
+	if err = mineBlocks(web3, store, params.BeaconConfig().Eth1FollowDistance); err != nil {
 		t.Fatalf("Unable to advance chain: %v", err)
 	}
 
-	return keystorePath, cmd.Process.Pid
+	return keystorePath
 }
 
 func mineBlocks(web3 *ethclient.Client, keystore *keystore.Key, blocksToMake uint64) error {
@@ -152,7 +152,7 @@ func mineBlocks(web3 *ethclient.Client, keystore *keystore.Key, blocksToMake uin
 		if err != nil {
 			return err
 		}
-		if err := web3.SendTransaction(context.Background(), signed); err != nil {
+		if err = web3.SendTransaction(context.Background(), signed); err != nil {
 			return err
 		}
 		nonce++

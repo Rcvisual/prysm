@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/prysmaticlabs/prysm/shared/prometheus"
+	"github.com/prysmaticlabs/prysm/shared/testutil/assert"
+	"github.com/prysmaticlabs/prysm/shared/testutil/require"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -22,15 +24,13 @@ type logger interface {
 }
 
 func TestLogrusCollector(t *testing.T) {
-	service := prometheus.NewPrometheusService(addr, nil)
+	service := prometheus.NewService(addr, nil)
 	hook := prometheus.NewLogrusCollector()
 	log.AddHook(hook)
 	go service.Start()
 	defer func() {
 		err := service.Stop()
-		if err != nil {
-			t.Error(err)
-		}
+		require.NoError(t, err)
 	}()
 
 	tests := []struct {
@@ -61,8 +61,8 @@ func TestLogrusCollector(t *testing.T) {
 				logExampleMessage(log.StandardLogger(), tt.level)
 			}
 			time.Sleep(time.Millisecond)
-			metrics := getMetrics(t)
-			count := getValueFor(t, metrics, prefix, tt.level)
+			metrics := metrics(t)
+			count := valueFor(t, metrics, prefix, tt.level)
 			if count != tt.want {
 				t.Errorf("Expecting %d and receive %d", tt.want, count)
 			}
@@ -70,19 +70,15 @@ func TestLogrusCollector(t *testing.T) {
 	}
 }
 
-func getMetrics(t *testing.T) []string {
+func metrics(t *testing.T) []string {
 	resp, err := http.Get(fmt.Sprintf("http://%s/metrics", addr))
-	if err != nil {
-		t.Error(err)
-	}
+	require.NoError(t, err)
 	body, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		t.Error(err)
-	}
+	require.NoError(t, err)
 	return strings.Split(string(body), "\n")
 }
 
-func getValueFor(t *testing.T, metrics []string, prefix string, level log.Level) int {
+func valueFor(t *testing.T, metrics []string, prefix string, level log.Level) int {
 	// Expect line with this pattern:
 	//   # HELP log_entries_total Total number of log messages.
 	//   # TYPE log_entries_total counter
@@ -92,9 +88,7 @@ func getValueFor(t *testing.T, metrics []string, prefix string, level log.Level)
 		if strings.HasPrefix(line, pattern) {
 			parts := strings.Split(line, " ")
 			count, err := strconv.ParseFloat(parts[1], 64)
-			if err != nil {
-				t.Errorf("Failed to convert metric counter to float: %s", err)
-			}
+			assert.NoError(t, err)
 			return int(count)
 		}
 	}

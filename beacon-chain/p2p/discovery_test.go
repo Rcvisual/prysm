@@ -1,6 +1,7 @@
 package p2p
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"fmt"
 	"math/rand"
@@ -8,17 +9,31 @@ import (
 	"os"
 	"path"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/ethereum/go-ethereum/p2p/discover"
 	"github.com/ethereum/go-ethereum/p2p/enode"
+	"github.com/ethereum/go-ethereum/p2p/enr"
+	"github.com/kevinms/leakybucket-go"
 	"github.com/libp2p/go-libp2p-core/host"
+	"github.com/libp2p/go-libp2p-core/network"
+	"github.com/libp2p/go-libp2p-core/peer"
+	ethpb "github.com/prysmaticlabs/ethereumapis/eth/v1alpha1"
+	"github.com/prysmaticlabs/go-bitfield"
 	mock "github.com/prysmaticlabs/prysm/beacon-chain/blockchain/testing"
 	"github.com/prysmaticlabs/prysm/beacon-chain/core/feed"
 	statefeed "github.com/prysmaticlabs/prysm/beacon-chain/core/feed/state"
+	"github.com/prysmaticlabs/prysm/beacon-chain/p2p/peers"
+	"github.com/prysmaticlabs/prysm/beacon-chain/p2p/peers/peerdata"
+	"github.com/prysmaticlabs/prysm/beacon-chain/p2p/peers/scorers"
+	testp2p "github.com/prysmaticlabs/prysm/beacon-chain/p2p/testing"
+	pb "github.com/prysmaticlabs/prysm/proto/beacon/p2p/v1"
+	"github.com/prysmaticlabs/prysm/shared/bytesutil"
 	"github.com/prysmaticlabs/prysm/shared/iputils"
-	"github.com/prysmaticlabs/prysm/shared/testutil"
+	"github.com/prysmaticlabs/prysm/shared/testutil/assert"
+	"github.com/prysmaticlabs/prysm/shared/testutil/require"
 	logTest "github.com/sirupsen/logrus/hooks/test"
 )
 
@@ -30,21 +45,14 @@ func init() {
 
 func createAddrAndPrivKey(t *testing.T) (net.IP, *ecdsa.PrivateKey) {
 	ip, err := iputils.ExternalIPv4()
-	if err != nil {
-		t.Fatalf("Could not get ip: %v", err)
-	}
+	require.NoError(t, err, "Could not get ip")
 	ipAddr := net.ParseIP(ip)
-	temp := testutil.TempDir()
+	temp := t.TempDir()
 	randNum := rand.Int()
 	tempPath := path.Join(temp, strconv.Itoa(randNum))
-	err = os.Mkdir(tempPath, 0700)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, os.Mkdir(tempPath, 0700))
 	pkey, err := privKey(&Config{DataDir: tempPath})
-	if err != nil {
-		t.Fatalf("Could not get private key: %v", err)
-	}
+	require.NoError(t, err, "Could not get private key")
 	return ipAddr, pkey
 }
 
@@ -53,19 +61,16 @@ func TestCreateListener(t *testing.T) {
 	ipAddr, pkey := createAddrAndPrivKey(t)
 	s := &Service{
 		genesisTime:           time.Now(),
-		genesisValidatorsRoot: []byte{'A'},
+		genesisValidatorsRoot: bytesutil.PadTo([]byte{'A'}, 32),
 		cfg:                   &Config{UDPPort: uint(port)},
 	}
-	listener := s.createListener(ipAddr, pkey)
+	listener, err := s.createListener(ipAddr, pkey)
+	require.NoError(t, err)
 	defer listener.Close()
 
-	if !listener.Self().IP().Equal(ipAddr) {
-		t.Errorf("Ip address is not the expected type, wanted %s but got %s", ipAddr.String(), listener.Self().IP().String())
-	}
+	assert.Equal(t, true, listener.Self().IP().Equal(ipAddr), "IP address is not the expected type")
+	assert.Equal(t, port, listener.Self().UDP(), "Incorrect port number")
 
-	if port != listener.Self().UDP() {
-		t.Errorf("In correct port number, wanted %d but got %d", port, listener.Self().UDP())
-	}
 	pubkey := listener.Self().Pubkey()
 	XisSame := pkey.PublicKey.X.Cmp(pubkey.X) == 0
 	YisSame := pkey.PublicKey.Y.Cmp(pubkey.Y) == 0
@@ -85,7 +90,8 @@ func TestStartDiscV5_DiscoverAllPeers(t *testing.T) {
 		genesisTime:           genesisTime,
 		genesisValidatorsRoot: genesisValidatorsRoot,
 	}
-	bootListener := s.createListener(ipAddr, pkey)
+	bootListener, err := s.createListener(ipAddr, pkey)
+	require.NoError(t, err)
 	defer bootListener.Close()
 
 	bootNode := bootListener.Self()
@@ -104,9 +110,7 @@ func TestStartDiscV5_DiscoverAllPeers(t *testing.T) {
 			genesisValidatorsRoot: genesisValidatorsRoot,
 		}
 		listener, err := s.startDiscoveryV5(ipAddr, pkey)
-		if err != nil {
-			t.Errorf("Could not start discovery for node: %v", err)
-		}
+		assert.NoError(t, err, "Could not start discovery for node")
 		listeners = append(listeners, listener)
 	}
 	defer func() {
@@ -132,16 +136,12 @@ func TestMultiAddrsConversion_InvalidIPAddr(t *testing.T) {
 	_, pkey := createAddrAndPrivKey(t)
 	s := &Service{
 		genesisTime:           time.Now(),
-		genesisValidatorsRoot: []byte{'A'},
+		genesisValidatorsRoot: bytesutil.PadTo([]byte{'A'}, 32),
 	}
 	node, err := s.createLocalNode(pkey, addr, 0, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	multiAddr := convertToMultiAddr([]*enode.Node{node.Node()})
-	if len(multiAddr) != 0 {
-		t.Error("Invalid ip address converted successfully")
-	}
+	assert.Equal(t, 0, len(multiAddr), "Invalid ip address converted successfully")
 }
 
 func TestMultiAddrConversion_OK(t *testing.T) {
@@ -153,15 +153,16 @@ func TestMultiAddrConversion_OK(t *testing.T) {
 			UDPPort: 0,
 		},
 		genesisTime:           time.Now(),
-		genesisValidatorsRoot: []byte{'A'},
+		genesisValidatorsRoot: bytesutil.PadTo([]byte{'A'}, 32),
 	}
-	listener := s.createListener(ipAddr, pkey)
+	listener, err := s.createListener(ipAddr, pkey)
+	require.NoError(t, err)
 	defer listener.Close()
 
 	_ = convertToMultiAddr([]*enode.Node{listener.Self()})
-	testutil.AssertLogsDoNotContain(t, hook, "Node doesn't have an ip4 address")
-	testutil.AssertLogsDoNotContain(t, hook, "Invalid port, the tcp port of the node is a reserved port")
-	testutil.AssertLogsDoNotContain(t, hook, "Could not get multiaddr")
+	require.LogsDoNotContain(t, hook, "Node doesn't have an ip4 address")
+	require.LogsDoNotContain(t, hook, "Invalid port, the tcp port of the node is a reserved port")
+	require.LogsDoNotContain(t, hook, "Could not get multiaddr")
 }
 
 func TestStaticPeering_PeersAreAdded(t *testing.T) {
@@ -191,16 +192,15 @@ func TestStaticPeering_PeersAreAdded(t *testing.T) {
 	cfg.StaticPeers = staticPeers
 	cfg.StateNotifier = &mock.MockStateNotifier{}
 	cfg.NoDiscovery = true
-	s, err := NewService(cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
+	s, err := NewService(context.Background(), cfg)
+	require.NoError(t, err)
 
 	exitRoutine := make(chan bool)
 	go func() {
 		s.Start()
 		<-exitRoutine
 	}()
+	time.Sleep(50 * time.Millisecond)
 	// Send in a loop to ensure it is delivered (busy wait for the service to subscribe to the state feed).
 	for sent := 0; sent == 0; {
 		sent = s.stateNotifier.StateFeed().Send(&feed.Event{
@@ -213,11 +213,129 @@ func TestStaticPeering_PeersAreAdded(t *testing.T) {
 	}
 	time.Sleep(4 * time.Second)
 	peers := s.host.Network().Peers()
-	if len(peers) != 5 {
-		t.Errorf("Not all peers added to peerstore, wanted %d but got %d", 5, len(peers))
-	}
-	if err := s.Stop(); err != nil {
-		t.Fatal(err)
-	}
+	assert.Equal(t, 5, len(peers), "Not all peers added to peerstore")
+	require.NoError(t, s.Stop())
 	exitRoutine <- true
+}
+
+func TestHostIsResolved(t *testing.T) {
+	// As defined in RFC 2606 , example.org is a
+	// reserved example domain name.
+	exampleHost := "example.org"
+	exampleIP := "93.184.216.34"
+
+	s := &Service{
+		cfg: &Config{
+			HostDNS: exampleHost,
+		},
+		genesisTime:           time.Now(),
+		genesisValidatorsRoot: bytesutil.PadTo([]byte{'A'}, 32),
+	}
+	ip, key := createAddrAndPrivKey(t)
+	list, err := s.createListener(ip, key)
+	require.NoError(t, err)
+
+	newIP := list.Self().IP()
+	assert.Equal(t, exampleIP, newIP.String(), "Did not resolve to expected IP")
+}
+
+func TestInboundPeerLimit(t *testing.T) {
+	fakePeer := testp2p.NewTestP2P(t)
+	s := &Service{
+		cfg:       &Config{MaxPeers: 30},
+		ipLimiter: leakybucket.NewCollector(ipLimit, ipBurst, false),
+		peers: peers.NewStatus(context.Background(), &peers.StatusConfig{
+			PeerLimit:    30,
+			ScorerParams: &scorers.Config{},
+		}),
+		host: fakePeer.BHost,
+	}
+
+	for i := 0; i < 30; i++ {
+		_ = addPeer(t, s.peers, peerdata.PeerConnectionState(ethpb.ConnectionState_CONNECTED))
+	}
+
+	require.Equal(t, true, s.isPeerAtLimit(false), "not at limit for outbound peers")
+	require.Equal(t, false, s.isPeerAtLimit(true), "at limit for inbound peers")
+
+	for i := 0; i < highWatermarkBuffer; i++ {
+		_ = addPeer(t, s.peers, peerdata.PeerConnectionState(ethpb.ConnectionState_CONNECTED))
+	}
+
+	require.Equal(t, true, s.isPeerAtLimit(true), "not at limit for inbound peers")
+}
+
+func TestUDPMultiAddress(t *testing.T) {
+	port := 6500
+	ipAddr, pkey := createAddrAndPrivKey(t)
+	genesisTime := time.Now()
+	genesisValidatorsRoot := make([]byte, 32)
+	s := &Service{
+		cfg:                   &Config{UDPPort: uint(port)},
+		genesisTime:           genesisTime,
+		genesisValidatorsRoot: genesisValidatorsRoot,
+	}
+	listener, err := s.createListener(ipAddr, pkey)
+	require.NoError(t, err)
+	defer listener.Close()
+	s.dv5Listener = listener
+
+	multiAddresses, err := s.DiscoveryAddresses()
+	require.NoError(t, err)
+	require.Equal(t, true, len(multiAddresses) > 0)
+	assert.Equal(t, true, strings.Contains(multiAddresses[0].String(), fmt.Sprintf("%d", port)))
+	assert.Equal(t, true, strings.Contains(multiAddresses[0].String(), "udp"))
+}
+
+func TestMultipleDiscoveryAddresses(t *testing.T) {
+	db, err := enode.OpenDB(t.TempDir())
+	require.NoError(t, err)
+	_, key := createAddrAndPrivKey(t)
+	node := enode.NewLocalNode(db, key)
+	node.Set(enr.IPv4{127, 0, 0, 1})
+	node.Set(enr.IPv6{0x20, 0x01, 0x48, 0x60, 0, 0, 0x20, 0x01, 0, 0, 0, 0, 0, 0, 0x00, 0x68})
+	s := &Service{dv5Listener: mockListener{localNode: node}}
+
+	multiAddresses, err := s.DiscoveryAddresses()
+	require.NoError(t, err)
+	require.Equal(t, 2, len(multiAddresses))
+	ipv4Found, ipv6Found := false, false
+	for _, address := range multiAddresses {
+		s := address.String()
+		if strings.Contains(s, "ip4") {
+			ipv4Found = true
+		} else if strings.Contains(s, "ip6") {
+			ipv6Found = true
+		}
+	}
+	assert.Equal(t, true, ipv4Found, "IPv4 discovery address not found")
+	assert.Equal(t, true, ipv6Found, "IPv6 discovery address not found")
+}
+
+func TestCorrectUDPVersion(t *testing.T) {
+	assert.Equal(t, "udp4", udpVersionFromIP(net.IPv4zero), "incorrect network version")
+	assert.Equal(t, "udp6", udpVersionFromIP(net.IPv6zero), "incorrect network version")
+	assert.Equal(t, "udp4", udpVersionFromIP(net.IP{200, 20, 12, 255}), "incorrect network version")
+	assert.Equal(t, "udp6", udpVersionFromIP(net.IP{22, 23, 24, 251, 17, 18, 0, 0, 0, 0, 12, 14, 212, 213, 16, 22}), "incorrect network version")
+	// v4 in v6
+	assert.Equal(t, "udp4", udpVersionFromIP(net.IP{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 212, 213, 16, 22}), "incorrect network version")
+}
+
+// addPeer is a helper to add a peer with a given connection state)
+func addPeer(t *testing.T, p *peers.Status, state peerdata.PeerConnectionState) peer.ID {
+	// Set up some peers with different states
+	mhBytes := []byte{0x11, 0x04}
+	idBytes := make([]byte, 4)
+	_, err := rand.Read(idBytes)
+	require.NoError(t, err)
+	mhBytes = append(mhBytes, idBytes...)
+	id, err := peer.IDFromBytes(mhBytes)
+	require.NoError(t, err)
+	p.Add(new(enr.Record), id, nil, network.DirInbound)
+	p.SetConnectionState(id, state)
+	p.SetMetadata(id, &pb.MetaData{
+		SeqNumber: 0,
+		Attnets:   bitfield.NewBitvector64(),
+	})
+	return id
 }

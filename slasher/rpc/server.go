@@ -2,8 +2,10 @@ package rpc
 
 import (
 	"context"
+	"sync"
 
 	"github.com/pkg/errors"
+	types "github.com/prysmaticlabs/eth2-types"
 	ethpb "github.com/prysmaticlabs/ethereumapis/eth/v1alpha1"
 	"github.com/prysmaticlabs/prysm/beacon-chain/core/helpers"
 	slashpb "github.com/prysmaticlabs/prysm/proto/slashing"
@@ -14,6 +16,7 @@ import (
 	"github.com/prysmaticlabs/prysm/slasher/beaconclient"
 	"github.com/prysmaticlabs/prysm/slasher/db"
 	"github.com/prysmaticlabs/prysm/slasher/detection"
+	"github.com/sirupsen/logrus"
 	"go.opencensus.io/trace"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -22,18 +25,53 @@ import (
 // Server defines a server implementation of the gRPC Slasher service,
 // providing RPC endpoints for retrieving slashing proofs for malicious validators.
 type Server struct {
-	ctx          context.Context
-	detector     *detection.Service
-	slasherDB    db.Database
-	beaconClient *beaconclient.Service
+	ctx             context.Context
+	detector        *detection.Service
+	slasherDB       db.Database
+	beaconClient    *beaconclient.Service
+	attestationLock sync.Mutex
+	proposeLock     sync.Mutex
+}
+
+// HighestAttestations returns the highest observed attestation source and epoch for a given validator id.
+func (s *Server) HighestAttestations(ctx context.Context, req *slashpb.HighestAttestationRequest) (*slashpb.HighestAttestationResponse, error) {
+	ctx, span := trace.StartSpan(ctx, "history.HighestAttestations")
+	defer span.End()
+
+	ret := make([]*slashpb.HighestAttestation, 0)
+	for _, id := range req.ValidatorIds {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+
+		res, err := s.slasherDB.HighestAttestation(ctx, id)
+		if err != nil {
+			return nil, err
+		}
+		if res != nil {
+			ret = append(ret, &slashpb.HighestAttestation{
+				ValidatorId:        res.ValidatorId,
+				HighestTargetEpoch: res.HighestTargetEpoch,
+				HighestSourceEpoch: res.HighestSourceEpoch,
+			})
+		}
+	}
+
+	return &slashpb.HighestAttestationResponse{
+		Attestations: ret,
+	}, nil
 }
 
 // IsSlashableAttestation returns an attester slashing if the attestation submitted
 // is a slashable vote.
-func (ss *Server) IsSlashableAttestation(ctx context.Context, req *ethpb.IndexedAttestation) (*slashpb.AttesterSlashingResponse, error) {
+func (s *Server) IsSlashableAttestation(ctx context.Context, req *ethpb.IndexedAttestation) (*slashpb.AttesterSlashingResponse, error) {
 	ctx, span := trace.StartSpan(ctx, "detection.IsSlashableAttestation")
 	defer span.End()
 
+	log.WithFields(logrus.Fields{
+		"slot":    req.Data.Slot,
+		"indices": req.AttestingIndices,
+	}).Debug("Received attestation via RPC")
 	if req == nil {
 		return nil, status.Error(codes.InvalidArgument, "nil request provided")
 	}
@@ -54,7 +92,7 @@ func (ss *Server) IsSlashableAttestation(ctx context.Context, req *ethpb.Indexed
 	if err != nil {
 		return nil, err
 	}
-	gvr, err := ss.beaconClient.GenesisValidatorsRoot(ctx)
+	gvr, err := s.beaconClient.GenesisValidatorsRoot(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -66,14 +104,17 @@ func (ss *Server) IsSlashableAttestation(ctx context.Context, req *ethpb.Indexed
 	if err != nil {
 		return nil, err
 	}
-	indices := req.AttestingIndices
-	pkMap, err := ss.beaconClient.FindOrGetPublicKeys(ctx, indices)
+	indices := make([]types.ValidatorIndex, len(req.AttestingIndices))
+	for i, index := range req.AttestingIndices {
+		indices[i] = types.ValidatorIndex(index)
+	}
+	pkMap, err := s.beaconClient.FindOrGetPublicKeys(ctx, indices)
 	if err != nil {
 		return nil, err
 	}
-	pubkeys := []bls.PublicKey{}
+	var pubkeys []bls.PublicKey
 	for _, pkBytes := range pkMap {
-		pk, err := bls.PublicKeyFromBytes(pkBytes[:])
+		pk, err := bls.PublicKeyFromBytes(pkBytes)
 		if err != nil {
 			return nil, errors.Wrap(err, "could not deserialize validator public key")
 		}
@@ -85,17 +126,22 @@ func (ss *Server) IsSlashableAttestation(ctx context.Context, req *ethpb.Indexed
 		log.WithError(err).Error("failed to verify indexed attestation signature")
 		return nil, status.Errorf(codes.Internal, "could not verify indexed attestation signature: %v: %v", req, err)
 	}
-	slashings, err := ss.detector.DetectAttesterSlashings(ctx, req)
+
+	s.attestationLock.Lock()
+	defer s.attestationLock.Unlock()
+
+	slashings, err := s.detector.DetectAttesterSlashings(ctx, req)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "could not detect attester slashings for attestation: %v: %v", req, err)
 	}
 	if len(slashings) < 1 {
-		if err := ss.slasherDB.SaveIndexedAttestation(ctx, req); err != nil {
+		if err := s.slasherDB.SaveIndexedAttestation(ctx, req); err != nil {
 			log.WithError(err).Error("Could not save indexed attestation")
 			return nil, status.Errorf(codes.Internal, "could not save indexed attestation: %v: %v", req, err)
 		}
-		if err := ss.detector.UpdateSpans(ctx, req); err != nil {
+		if err := s.detector.UpdateSpans(ctx, req); err != nil {
 			log.WithError(err).Error("could not update spans")
+			return nil, status.Errorf(codes.Internal, "failed to update spans: %v: %v", req, err)
 		}
 	}
 	return &slashpb.AttesterSlashingResponse{
@@ -105,10 +151,14 @@ func (ss *Server) IsSlashableAttestation(ctx context.Context, req *ethpb.Indexed
 
 // IsSlashableBlock returns an proposer slashing if the block submitted
 // is a double proposal.
-func (ss *Server) IsSlashableBlock(ctx context.Context, req *ethpb.SignedBeaconBlockHeader) (*slashpb.ProposerSlashingResponse, error) {
+func (s *Server) IsSlashableBlock(ctx context.Context, req *ethpb.SignedBeaconBlockHeader) (*slashpb.ProposerSlashingResponse, error) {
 	ctx, span := trace.StartSpan(ctx, "detection.IsSlashableBlock")
 	defer span.End()
 
+	log.WithFields(logrus.Fields{
+		"slot":           req.Header.Slot,
+		"proposer_index": req.Header.ProposerIndex,
+	}).Info("Received block via RPC")
 	if req == nil {
 		return nil, status.Error(codes.InvalidArgument, "nil request provided")
 	}
@@ -119,7 +169,7 @@ func (ss *Server) IsSlashableBlock(ctx context.Context, req *ethpb.SignedBeaconB
 	if req.Signature == nil {
 		return nil, status.Error(codes.InvalidArgument, "nil signature provided")
 	}
-	gvr, err := ss.beaconClient.GenesisValidatorsRoot(ctx)
+	gvr, err := s.beaconClient.GenesisValidatorsRoot(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -132,12 +182,21 @@ func (ss *Server) IsSlashableBlock(ctx context.Context, req *ethpb.SignedBeaconB
 	if err != nil {
 		return nil, err
 	}
-	pkMap, err := ss.beaconClient.FindOrGetPublicKeys(ctx, []uint64{req.Header.ProposerIndex})
-	if err := helpers.VerifyBlockHeaderSigningRoot(
-		req.Header, pkMap[req.Header.ProposerIndex], req.Signature, domain); err != nil {
+	pkMap, err := s.beaconClient.FindOrGetPublicKeys(ctx, []types.ValidatorIndex{req.Header.ProposerIndex})
+	if err != nil {
 		return nil, err
 	}
-	slashing, err := ss.detector.DetectDoubleProposals(ctx, req)
+	if err := helpers.VerifyBlockHeaderSigningRoot(
+		req.Header,
+		pkMap[req.Header.ProposerIndex],
+		req.Signature, domain); err != nil {
+		return nil, err
+	}
+
+	s.proposeLock.Lock()
+	defer s.proposeLock.Unlock()
+
+	slashing, err := s.detector.DetectDoubleProposals(ctx, req)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "could not detect proposer slashing for block: %v: %v", req, err)
 	}
@@ -153,9 +212,9 @@ func (ss *Server) IsSlashableBlock(ctx context.Context, req *ethpb.SignedBeaconB
 
 // IsSlashableAttestationNoUpdate returns true if the attestation submitted
 // is a slashable vote (no db update is being done).
-func (ss *Server) IsSlashableAttestationNoUpdate(ctx context.Context, req *ethpb.IndexedAttestation) (*slashpb.Slashable, error) {
+func (s *Server) IsSlashableAttestationNoUpdate(ctx context.Context, req *ethpb.IndexedAttestation) (*slashpb.Slashable, error) {
 	sl := &slashpb.Slashable{}
-	slashings, err := ss.detector.DetectAttesterSlashings(ctx, req)
+	slashings, err := s.detector.DetectAttesterSlashings(ctx, req)
 	if err != nil {
 		return sl, status.Errorf(codes.Internal, "could not detect attester slashings for attestation: %v: %v", req, err)
 	}
@@ -168,9 +227,9 @@ func (ss *Server) IsSlashableAttestationNoUpdate(ctx context.Context, req *ethpb
 
 // IsSlashableBlockNoUpdate returns true if the block submitted
 // is slashable (no db update is being done).
-func (ss *Server) IsSlashableBlockNoUpdate(ctx context.Context, req *ethpb.BeaconBlockHeader) (*slashpb.Slashable, error) {
+func (s *Server) IsSlashableBlockNoUpdate(ctx context.Context, req *ethpb.BeaconBlockHeader) (*slashpb.Slashable, error) {
 	sl := &slashpb.Slashable{}
-	slash, err := ss.detector.DetectDoubleProposeNoUpdate(ctx, req)
+	slash, err := s.detector.DetectDoubleProposeNoUpdate(ctx, req)
 	if err != nil {
 		return sl, status.Errorf(codes.Internal, "could not detect proposer slashing for block: %v: %v", req, err)
 	}

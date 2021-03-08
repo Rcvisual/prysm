@@ -25,7 +25,7 @@ func New(ctx context.Context, state *stateTrie.BeaconState) ([]*Validator, *Bala
 	currentEpoch := helpers.CurrentEpoch(state)
 	prevEpoch := helpers.PrevEpoch(state)
 
-	if err := state.ReadFromEveryValidator(func(idx int, val *stateTrie.ReadOnlyValidator) error {
+	if err := state.ReadFromEveryValidator(func(idx int, val stateTrie.ReadOnlyValidator) error {
 		// Was validator withdrawable or slashed
 		withdrawable := prevEpoch+1 >= val.WithdrawableEpoch()
 		pVal := &Validator{
@@ -45,8 +45,8 @@ func New(ctx context.Context, state *stateTrie.BeaconState) ([]*Validator, *Bala
 		}
 		// Set inclusion slot and inclusion distance to be max, they will be compared and replaced
 		// with the lower values
-		pVal.InclusionSlot = params.BeaconConfig().FarFutureEpoch
-		pVal.InclusionDistance = params.BeaconConfig().FarFutureEpoch
+		pVal.InclusionSlot = params.BeaconConfig().FarFutureSlot
+		pVal.InclusionDistance = params.BeaconConfig().FarFutureSlot
 
 		pValidators[idx] = pVal
 		return nil

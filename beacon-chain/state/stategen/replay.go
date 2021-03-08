@@ -5,67 +5,17 @@ import (
 	"fmt"
 
 	"github.com/pkg/errors"
+	types "github.com/prysmaticlabs/eth2-types"
 	ethpb "github.com/prysmaticlabs/ethereumapis/eth/v1alpha1"
 	transition "github.com/prysmaticlabs/prysm/beacon-chain/core/state"
 	"github.com/prysmaticlabs/prysm/beacon-chain/db/filters"
-	"github.com/prysmaticlabs/prysm/beacon-chain/state"
 	stateTrie "github.com/prysmaticlabs/prysm/beacon-chain/state"
-	"github.com/prysmaticlabs/prysm/beacon-chain/state/stateutil"
 	"github.com/prysmaticlabs/prysm/shared/bytesutil"
-	"github.com/prysmaticlabs/prysm/shared/featureconfig"
-	"github.com/prysmaticlabs/prysm/shared/params"
 	"go.opencensus.io/trace"
 )
 
-// ComputeStateUpToSlot returns a processed state up to input target slot.
-// If the last processed block is at slot 32, given input target slot at 40, this
-// returns processed state up to slot 40 via empty slots.
-// If there's duplicated blocks in a single slot, the canonical block will be returned.
-func (s *State) ComputeStateUpToSlot(ctx context.Context, targetSlot uint64) (*state.BeaconState, error) {
-	ctx, span := trace.StartSpan(ctx, "stateGen.ComputeStateUpToSlot")
-	defer span.End()
-
-	// Return genesis state if target slot is 0.
-	if targetSlot == 0 {
-		return s.beaconDB.GenesisState(ctx)
-	}
-
-	lastBlockRoot, lastBlockSlot, err := s.lastSavedBlock(ctx, targetSlot)
-	if err != nil {
-		return nil, errors.Wrap(err, "could not get last saved block")
-	}
-
-	lastState, err := s.lastSavedState(ctx, targetSlot)
-	if err != nil {
-		return nil, errors.Wrap(err, "could not get last valid state")
-	}
-	if lastState == nil {
-		return nil, errUnknownState
-	}
-	// Short circuit if no block was saved, replay using slots only.
-	if lastBlockSlot == 0 {
-		return s.ReplayBlocks(ctx, lastState, []*ethpb.SignedBeaconBlock{}, targetSlot)
-	}
-
-	// Return if the last valid state's slot is higher than the target slot.
-	if lastState.Slot() >= targetSlot {
-		return lastState, nil
-	}
-
-	blks, err := s.LoadBlocks(ctx, lastState.Slot()+1, lastBlockSlot, lastBlockRoot)
-	if err != nil {
-		return nil, errors.Wrap(err, "could not load blocks")
-	}
-	lastState, err = s.ReplayBlocks(ctx, lastState, blks, targetSlot)
-	if err != nil {
-		return nil, errors.Wrap(err, "could not replay blocks")
-	}
-
-	return lastState, nil
-}
-
 // ReplayBlocks replays the input blocks on the input state until the target slot is reached.
-func (s *State) ReplayBlocks(ctx context.Context, state *state.BeaconState, signed []*ethpb.SignedBeaconBlock, targetSlot uint64) (*state.BeaconState, error) {
+func (s *State) ReplayBlocks(ctx context.Context, state *stateTrie.BeaconState, signed []*ethpb.SignedBeaconBlock, targetSlot types.Slot) (*stateTrie.BeaconState, error) {
 	ctx, span := trace.StartSpan(ctx, "stateGen.ReplayBlocks")
 	defer span.End()
 
@@ -73,36 +23,28 @@ func (s *State) ReplayBlocks(ctx context.Context, state *state.BeaconState, sign
 	// The input block list is sorted in decreasing slots order.
 	if len(signed) > 0 {
 		for i := len(signed) - 1; i >= 0; i-- {
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
 			if state.Slot() >= targetSlot {
 				break
 			}
-
-			if featureconfig.Get().EnableStateGenSigVerify {
-				state, err = transition.ExecuteStateTransition(ctx, state, signed[i])
-				if err != nil {
-					return nil, err
-				}
-			} else {
-				state, err = executeStateTransitionStateGen(ctx, state, signed[i])
-				if err != nil {
-					return nil, err
-				}
+			// A node shouldn't process the block if the block slot is lower than the state slot.
+			if state.Slot() >= signed[i].Block.Slot {
+				continue
+			}
+			state, err = executeStateTransitionStateGen(ctx, state, signed[i])
+			if err != nil {
+				return nil, err
 			}
 		}
 	}
 
 	// If there is skip slots at the end.
 	if targetSlot > state.Slot() {
-		if featureconfig.Get().EnableStateGenSigVerify {
-			state, err = transition.ProcessSlots(ctx, state, targetSlot)
-			if err != nil {
-				return nil, err
-			}
-		} else {
-			state, err = processSlotsStateGen(ctx, state, targetSlot)
-			if err != nil {
-				return nil, err
-			}
+		state, err = processSlotsStateGen(ctx, state, targetSlot)
+		if err != nil {
+			return nil, err
 		}
 	}
 
@@ -111,13 +53,13 @@ func (s *State) ReplayBlocks(ctx context.Context, state *state.BeaconState, sign
 
 // LoadBlocks loads the blocks between start slot and end slot by recursively fetching from end block root.
 // The Blocks are returned in slot-descending order.
-func (s *State) LoadBlocks(ctx context.Context, startSlot uint64, endSlot uint64, endBlockRoot [32]byte) ([]*ethpb.SignedBeaconBlock, error) {
-	filter := filters.NewFilter().SetStartSlot(startSlot).SetEndSlot(endSlot)
-	blocks, err := s.beaconDB.Blocks(ctx, filter)
-	if err != nil {
-		return nil, err
+func (s *State) LoadBlocks(ctx context.Context, startSlot, endSlot types.Slot, endBlockRoot [32]byte) ([]*ethpb.SignedBeaconBlock, error) {
+	// Nothing to load for invalid range.
+	if endSlot < startSlot {
+		return nil, fmt.Errorf("start slot %d >= end slot %d", startSlot, endSlot)
 	}
-	blockRoots, err := s.beaconDB.BlockRoots(ctx, filter)
+	filter := filters.NewFilter().SetStartSlot(startSlot).SetEndSlot(endSlot)
+	blocks, blockRoots, err := s.beaconDB.Blocks(ctx, filter)
 	if err != nil {
 		return nil, err
 	}
@@ -135,6 +77,9 @@ func (s *State) LoadBlocks(ctx context.Context, startSlot uint64, endSlot uint64
 	// Covers the edge case if there's multiple blocks on the same end slot,
 	// the end root may not be the last index in `blockRoots`.
 	for length >= 3 && blocks[length-1].Block.Slot == blocks[length-2].Block.Slot && blockRoots[length-1] != endBlockRoot {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 		length--
 		if blockRoots[length-2] == endBlockRoot {
 			length--
@@ -149,6 +94,9 @@ func (s *State) LoadBlocks(ctx context.Context, startSlot uint64, endSlot uint64
 	filteredBlocks := []*ethpb.SignedBeaconBlock{blocks[length-1]}
 	// Starting from second to last index because the last block is already in the filtered block list.
 	for i := length - 2; i >= 0; i-- {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 		b := filteredBlocks[len(filteredBlocks)-1]
 		if bytesutil.ToBytes32(b.Block.ParentRoot) != blockRoots[i] {
 			continue
@@ -175,7 +123,7 @@ func executeStateTransitionStateGen(
 		return nil, errUnknownBlock
 	}
 
-	ctx, span := trace.StartSpan(ctx, "beacon-chain.ChainService.ExecuteStateTransitionStateGen")
+	ctx, span := trace.StartSpan(ctx, "stategen.ExecuteStateTransitionStateGen")
 	defer span.End()
 	var err error
 
@@ -200,8 +148,8 @@ func executeStateTransitionStateGen(
 // processSlotsStateGen to process old slots for state gen usages.
 // There's no skip slot cache involved given state gen only works with already stored block and state in DB.
 // WARNING: This method should not be used for future slot.
-func processSlotsStateGen(ctx context.Context, state *stateTrie.BeaconState, slot uint64) (*stateTrie.BeaconState, error) {
-	ctx, span := trace.StartSpan(ctx, "beacon-chain.ChainService.ProcessSlotsStateGen")
+func processSlotsStateGen(ctx context.Context, state *stateTrie.BeaconState, slot types.Slot) (*stateTrie.BeaconState, error) {
+	ctx, span := trace.StartSpan(ctx, "stategen.ProcessSlotsStateGen")
 	defer span.End()
 	if state == nil {
 		return nil, errUnknownState
@@ -239,7 +187,7 @@ func processSlotsStateGen(ctx context.Context, state *stateTrie.BeaconState, slo
 // This finds the last saved block in DB from searching backwards from input slot,
 // it returns the block root and the slot of the block.
 // This is used by both hot and cold state management.
-func (s *State) lastSavedBlock(ctx context.Context, slot uint64) ([32]byte, uint64, error) {
+func (s *State) lastSavedBlock(ctx context.Context, slot types.Slot) ([32]byte, types.Slot, error) {
 	ctx, span := trace.StartSpan(ctx, "stateGen.lastSavedBlock")
 	defer span.End()
 
@@ -264,7 +212,7 @@ func (s *State) lastSavedBlock(ctx context.Context, slot uint64) ([32]byte, uint
 	if lastSaved[0] == nil || lastSaved[0].Block == nil {
 		return [32]byte{}, 0, nil
 	}
-	r, err := stateutil.BlockRoot(lastSaved[0].Block)
+	r, err := lastSaved[0].Block.HashTreeRoot()
 	if err != nil {
 		return [32]byte{}, 0, err
 	}
@@ -275,7 +223,7 @@ func (s *State) lastSavedBlock(ctx context.Context, slot uint64) ([32]byte, uint
 // This finds the last saved state in DB from searching backwards from input slot,
 // it returns the block root of the block which was used to produce the state.
 // This is used by both hot and cold state management.
-func (s *State) lastSavedState(ctx context.Context, slot uint64) (*state.BeaconState, error) {
+func (s *State) lastSavedState(ctx context.Context, slot types.Slot) (*stateTrie.BeaconState, error) {
 	ctx, span := trace.StartSpan(ctx, "stateGen.lastSavedState")
 	defer span.End()
 
@@ -306,95 +254,25 @@ func (s *State) genesisRoot(ctx context.Context) ([32]byte, error) {
 	if err != nil {
 		return [32]byte{}, err
 	}
-	return stateutil.BlockRoot(b.Block)
+	return b.Block.HashTreeRoot()
 }
 
-// This returns the highest archived root based on input slot in the DB.
-// If the archived root is not available at that exact input slot due to an event of skip block,
-// this will look back and return the last available archived root (ie. the one with the highest slot below input slot).
-func (s *State) archivedRoot(ctx context.Context, slot uint64) ([32]byte, error) {
-	archivedIndex := slot / params.BeaconConfig().SlotsPerArchivedPoint
-	for archivedIndex > 0 {
-		if ctx.Err() != nil {
-			return [32]byte{}, ctx.Err()
+// Given the start slot and the end slot, this returns the finalized beacon blocks in between.
+// Since hot states don't have finalized blocks, this should ONLY be used for replaying cold state.
+func (s *State) loadFinalizedBlocks(ctx context.Context, startSlot, endSlot types.Slot) ([]*ethpb.SignedBeaconBlock, error) {
+	f := filters.NewFilter().SetStartSlot(startSlot).SetEndSlot(endSlot)
+	bs, bRoots, err := s.beaconDB.Blocks(ctx, f)
+	if err != nil {
+		return nil, err
+	}
+	if len(bs) != len(bRoots) {
+		return nil, errors.New("length of blocks and roots don't match")
+	}
+	fbs := make([]*ethpb.SignedBeaconBlock, 0, len(bs))
+	for i := len(bs) - 1; i >= 0; i-- {
+		if s.beaconDB.IsFinalizedBlock(ctx, bRoots[i]) {
+			fbs = append(fbs, bs[i])
 		}
-		if s.beaconDB.HasArchivedPoint(ctx, archivedIndex) {
-			return s.beaconDB.ArchivedPointRoot(ctx, archivedIndex), nil
-		}
-		archivedIndex--
 	}
-
-	if archivedIndex == 0 {
-		return s.genesisRoot(ctx)
-	}
-
-	return [32]byte{}, errUnknownArchivedState
-}
-
-// This retrieves the archived state in the DB.
-func (s *State) archivedState(ctx context.Context, slot uint64) (*state.BeaconState, error) {
-	archivedRoot, err := s.archivedRoot(ctx, slot)
-	if err != nil {
-		return nil, err
-	}
-	return s.beaconDB.State(ctx, archivedRoot)
-}
-
-// This recomputes a state given the block root.
-func (s *State) recoverStateByRoot(ctx context.Context, root [32]byte) (*state.BeaconState, error) {
-	ctx, span := trace.StartSpan(ctx, "stateGen.recoverStateByRoot")
-	defer span.End()
-
-	lastAncestorState, err := s.lastAncestorState(ctx, root)
-	if err != nil {
-		return nil, err
-	}
-	if lastAncestorState == nil {
-		return nil, errUnknownState
-	}
-
-	targetBlk, err := s.beaconDB.Block(ctx, root)
-	if err != nil {
-		return nil, err
-	}
-	if targetBlk == nil {
-		return nil, errUnknownBlock
-	}
-	blks, err := s.LoadBlocks(ctx, lastAncestorState.Slot()+1, targetBlk.Block.Slot, root)
-	if err != nil {
-		return nil, errors.Wrap(err, "could not load blocks for cold state using root")
-	}
-
-	return s.ReplayBlocks(ctx, lastAncestorState, blks, targetBlk.Block.Slot)
-}
-
-// This processes a state up to input slot.
-func (s *State) processStateUpTo(ctx context.Context, state *state.BeaconState, slot uint64) (*state.BeaconState, error) {
-	ctx, span := trace.StartSpan(ctx, "stateGen.processStateUpTo")
-	defer span.End()
-
-	// Short circuit if the slot is already less than pre state.
-	if state.Slot() >= slot {
-		return state, nil
-	}
-
-	lastBlockRoot, lastBlockSlot, err := s.lastSavedBlock(ctx, slot)
-	if err != nil {
-		return nil, errors.Wrap(err, "could not get last saved block")
-	}
-	// Short circuit if no block was saved, replay using slots only.
-	if lastBlockSlot == 0 {
-		return s.ReplayBlocks(ctx, state, []*ethpb.SignedBeaconBlock{}, slot)
-	}
-
-	blks, err := s.LoadBlocks(ctx, state.Slot()+1, lastBlockSlot, lastBlockRoot)
-	if err != nil {
-		return nil, errors.Wrap(err, "could not load blocks")
-	}
-	state, err = s.ReplayBlocks(ctx, state, blks, slot)
-	if err != nil {
-		return nil, errors.Wrap(err, "could not replay blocks")
-	}
-
-	return state, nil
+	return fbs, nil
 }

@@ -6,9 +6,11 @@ import (
 	"sort"
 	"time"
 
+	"github.com/libp2p/go-libp2p-core/peer"
+	types "github.com/prysmaticlabs/eth2-types"
 	eth "github.com/prysmaticlabs/ethereumapis/eth/v1alpha1"
 	"github.com/prysmaticlabs/prysm/beacon-chain/core/helpers"
-	"github.com/prysmaticlabs/prysm/shared/roughtime"
+	"github.com/prysmaticlabs/prysm/shared/timeutils"
 )
 
 const (
@@ -32,8 +34,8 @@ type eventID uint8
 
 // stateMachineManager is a collection of managed FSMs.
 type stateMachineManager struct {
-	keys     []uint64
-	machines map[uint64]*stateMachine
+	keys     []types.Slot
+	machines map[types.Slot]*stateMachine
 	handlers map[stateID]map[eventID]eventHandlerFn
 }
 
@@ -41,8 +43,9 @@ type stateMachineManager struct {
 // Each FSM allows deterministic state transitions: State(S) x Event(E) -> Actions (A), State(S').
 type stateMachine struct {
 	smm     *stateMachineManager
-	start   uint64
+	start   types.Slot
 	state   stateID
+	pid     peer.ID
 	blocks  []*eth.SignedBeaconBlock
 	updated time.Time
 }
@@ -53,8 +56,8 @@ type eventHandlerFn func(m *stateMachine, data interface{}) (newState stateID, e
 // newStateMachineManager returns fully initialized state machine manager.
 func newStateMachineManager() *stateMachineManager {
 	return &stateMachineManager{
-		keys:     make([]uint64, 0, lookaheadSteps),
-		machines: make(map[uint64]*stateMachine, lookaheadSteps),
+		keys:     make([]types.Slot, 0, lookaheadSteps),
+		machines: make(map[types.Slot]*stateMachine, lookaheadSteps),
 		handlers: make(map[stateID]map[eventID]eventHandlerFn),
 	}
 }
@@ -70,25 +73,25 @@ func (smm *stateMachineManager) addEventHandler(event eventID, state stateID, fn
 }
 
 // addStateMachine allocates memory for new FSM.
-func (smm *stateMachineManager) addStateMachine(start uint64) *stateMachine {
-	smm.machines[start] = &stateMachine{
+func (smm *stateMachineManager) addStateMachine(startSlot types.Slot) *stateMachine {
+	smm.machines[startSlot] = &stateMachine{
 		smm:     smm,
-		start:   start,
+		start:   startSlot,
 		state:   stateNew,
 		blocks:  []*eth.SignedBeaconBlock{},
-		updated: roughtime.Now(),
+		updated: timeutils.Now(),
 	}
 	smm.recalculateMachineAttribs()
-	return smm.machines[start]
+	return smm.machines[startSlot]
 }
 
 // removeStateMachine frees memory of a processed/finished FSM.
-func (smm *stateMachineManager) removeStateMachine(start uint64) error {
-	if _, ok := smm.machines[start]; !ok {
-		return fmt.Errorf("state for machine %v is not found", start)
+func (smm *stateMachineManager) removeStateMachine(startSlot types.Slot) error {
+	if _, ok := smm.machines[startSlot]; !ok {
+		return fmt.Errorf("state for machine %v is not found", startSlot)
 	}
-	smm.machines[start].blocks = nil
-	delete(smm.machines, start)
+	smm.machines[startSlot].blocks = nil
+	delete(smm.machines, startSlot)
 	smm.recalculateMachineAttribs()
 	return nil
 }
@@ -106,7 +109,7 @@ func (smm *stateMachineManager) removeAllStateMachines() error {
 
 // recalculateMachineAttribs updates cached attributes, which are used for efficiency.
 func (smm *stateMachineManager) recalculateMachineAttribs() {
-	keys := make([]uint64, 0, lookaheadSteps)
+	keys := make([]types.Slot, 0, lookaheadSteps)
 	for key := range smm.machines {
 		keys = append(keys, key)
 	}
@@ -116,14 +119,14 @@ func (smm *stateMachineManager) recalculateMachineAttribs() {
 	smm.keys = keys
 }
 
-// findStateMachine returns a state machine for a given start block (if exists).
-func (smm *stateMachineManager) findStateMachine(startBlock uint64) (*stateMachine, bool) {
-	fsm, ok := smm.machines[startBlock]
+// findStateMachine returns a state machine for a given start slot (if exists).
+func (smm *stateMachineManager) findStateMachine(startSlot types.Slot) (*stateMachine, bool) {
+	fsm, ok := smm.machines[startSlot]
 	return fsm, ok
 }
 
-// highestStartBlock returns the start block number for the latest known state machine.
-func (smm *stateMachineManager) highestStartBlock() (uint64, error) {
+// highestStartSlot returns the start slot for the latest known state machine.
+func (smm *stateMachineManager) highestStartSlot() (types.Slot, error) {
 	if len(smm.keys) == 0 {
 		return 0, errors.New("no state machine exist")
 	}
@@ -155,12 +158,12 @@ func (m *stateMachine) setState(name stateID) {
 		return
 	}
 	m.state = name
-	m.updated = roughtime.Now()
+	m.updated = timeutils.Now()
 }
 
 // trigger invokes the event handler on a given state machine.
 func (m *stateMachine) trigger(event eventID, data interface{}) error {
-	handlers, ok := (*m.smm).handlers[m.state]
+	handlers, ok := m.smm.handlers[m.state]
 	if !ok {
 		return fmt.Errorf("no event handlers registered for event: %v, state: %v", event, m.state)
 	}
@@ -174,20 +177,14 @@ func (m *stateMachine) trigger(event eventID, data interface{}) error {
 	return nil
 }
 
-// isFirst checks whether a given machine has the lowest start block.
+// isFirst checks whether a given machine has the lowest start slot.
 func (m *stateMachine) isFirst() bool {
-	if m.start == (*m.smm).keys[0] {
-		return true
-	}
-	return false
+	return m.start == m.smm.keys[0]
 }
 
-// isLast checks whether a given machine has the highest start block.
+// isLast checks whether a given machine has the highest start slot.
 func (m *stateMachine) isLast() bool {
-	if m.start == (*m.smm).keys[len((*m.smm).keys)-1] {
-		return true
-	}
-	return false
+	return m.start == m.smm.keys[len(m.smm.keys)-1]
 }
 
 // String returns human-readable representation of a FSM state.
@@ -205,7 +202,7 @@ func (s stateID) String() string {
 		stateSent:       "sent",
 	}
 	if _, ok := states[s]; !ok {
-		return ""
+		return "stateUnknown"
 	}
 	return states[s]
 }
@@ -217,7 +214,7 @@ func (e eventID) String() string {
 		eventDataReceived: "dataReceived",
 	}
 	if _, ok := events[e]; !ok {
-		return ""
+		return "eventUnknown"
 	}
 	return events[e]
 }

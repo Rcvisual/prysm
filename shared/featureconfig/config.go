@@ -20,7 +20,9 @@ The process for implementing new features using this package is as follows:
 package featureconfig
 
 import (
-	"github.com/prysmaticlabs/prysm/shared/cmd"
+	"sync"
+	"time"
+
 	"github.com/prysmaticlabs/prysm/shared/params"
 	"github.com/sirupsen/logrus"
 	"github.com/urfave/cli/v2"
@@ -28,58 +30,55 @@ import (
 
 var log = logrus.WithField("prefix", "flags")
 
+const enabledFeatureFlag = "Enabled feature flag"
+
 // Flags is a struct to represent which features the client will perform on runtime.
 type Flags struct {
 	// Testnet Flags.
-	AltonaTestnet bool // AltonaTestnet defines the flag through which we can enable the node to run on the altona testnet.
+	ToledoTestnet  bool // ToledoTestnet defines the flag through which we can enable the node to run on the Toledo testnet.
+	PyrmontTestnet bool // PyrmontTestnet defines the flag through which we can enable the node to run on the Pyrmont testnet.
+
 	// Feature related flags.
-	WriteSSZStateTransitions                   bool // WriteSSZStateTransitions to tmp directory.
-	InitSyncNoVerify                           bool // InitSyncNoVerify when initial syncing w/o verifying block's contents.
-	DisableDynamicCommitteeSubnets             bool // Disables dynamic attestation committee subnets via p2p.
-	SkipBLSVerify                              bool // Skips BLS verification across the runtime.
-	EnableBackupWebhook                        bool // EnableBackupWebhook to allow database backups to trigger from monitoring port /db/backup.
-	PruneEpochBoundaryStates                   bool // PruneEpochBoundaryStates prunes the epoch boundary state before last finalized check point.
-	EnableSnappyDBCompression                  bool // EnableSnappyDBCompression in the database.
-	LocalProtection                            bool // LocalProtection prevents the validator client from signing any messages that would be considered a slashable offense from the validators view.
-	SlasherProtection                          bool // SlasherProtection protects validator fron sending over a slashable offense over the network using external slasher.
-	DisableStrictAttestationPubsubVerification bool // DisableStrictAttestationPubsubVerification will disabling strict signature verification in pubsub.
-	DisableUpdateHeadPerAttestation            bool // DisableUpdateHeadPerAttestation will disabling update head on per attestation basis.
-	EnableDomainDataCache                      bool // EnableDomainDataCache caches validator calls to DomainData per epoch.
-	EnableStateGenSigVerify                    bool // EnableStateGenSigVerify verifies proposer and randao signatures during state gen.
-	CheckHeadState                             bool // CheckHeadState checks the current headstate before retrieving the desired state from the db.
-	EnableNoise                                bool // EnableNoise enables the beacon node to use NOISE instead of SECIO when performing a handshake with another peer.
-	DontPruneStateStartUp                      bool // DontPruneStateStartUp disables pruning state upon beacon node start up.
-	NewStateMgmt                               bool // NewStateMgmt enables the new state mgmt service.
-	WaitForSynced                              bool // WaitForSynced uses WaitForSynced in validator startup to ensure it can communicate with the beacon node as soon as possible.
-	SkipRegenHistoricalStates                  bool // SkipRegenHistoricalState skips regenerating historical states from genesis to last finalized. This enables a quick switch over to using new-state-mgmt.
-	ReduceAttesterStateCopy                    bool // ReduceAttesterStateCopy reduces head state copies for attester rpc.
-	// DisableForkChoice disables using LMD-GHOST fork choice to update
-	// the head of the chain based on attestations and instead accepts any valid received block
-	// as the chain head. UNSAFE, use with caution.
-	DisableForkChoice bool
+	WriteSSZStateTransitions           bool // WriteSSZStateTransitions to tmp directory.
+	SkipBLSVerify                      bool // Skips BLS verification across the runtime.
+	EnableBlst                         bool // Enables new BLS library from supranational.
+	SlasherProtection                  bool // SlasherProtection protects validator fron sending over a slashable offense over the network using external slasher.
+	EnablePeerScorer                   bool // EnablePeerScorer enables experimental peer scoring in p2p.
+	EnableLargerGossipHistory          bool // EnableLargerGossipHistory increases the gossip history we store in our caches.
+	WriteWalletPasswordOnWebOnboarding bool // WriteWalletPasswordOnWebOnboarding writes the password to disk after Prysm web signup.
+	DisableAttestingHistoryDBCache     bool // DisableAttestingHistoryDBCache for the validator client increases disk reads/writes.
+	UpdateHeadTimely                   bool // UpdateHeadTimely updates head right after state transition.
 
 	// Logging related toggles.
 	DisableGRPCConnectionLogs bool // Disables logging when a new grpc client has connected.
 
 	// Slasher toggles.
-	DisableBroadcastSlashings bool // DisableBroadcastSlashings disables p2p broadcasting of proposer and attester slashings.
-	EnableHistoricalDetection bool // EnableHistoricalDetection disables historical attestation detection and performs detection on the chain head immediately.
 	DisableLookback           bool // DisableLookback updates slasher to not use the lookback and update validator histories until epoch 0.
+	DisableBroadcastSlashings bool // DisableBroadcastSlashings disables p2p broadcasting of proposer and attester slashings.
 
 	// Cache toggles.
-	EnableSSZCache          bool // EnableSSZCache see https://github.com/prysmaticlabs/prysm/pull/4558.
-	EnableEth1DataVoteCache bool // EnableEth1DataVoteCache; see https://github.com/prysmaticlabs/prysm/issues/3106.
-	EnableSlasherConnection bool // EnableSlasher enable retrieval of slashing events from a slasher instance.
-	EnableBlockTreeCache    bool // EnableBlockTreeCache enable fork choice service to maintain latest filtered block tree.
+	EnableSSZCache           bool // EnableSSZCache see https://github.com/prysmaticlabs/prysm/pull/4558.
+	EnableNextSlotStateCache bool // EnableNextSlotStateCache enables next slot state cache to improve validator performance.
+
+	// Bug fixes related flags.
+	AttestTimely bool // AttestTimely fixes #8185. It is gated behind a flag to ensure beacon node's fix can safely roll out first. We'll invert this in v1.1.0.
 
 	KafkaBootstrapServers          string // KafkaBootstrapServers to find kafka servers to stream blocks, attestations, etc.
 	AttestationAggregationStrategy string // AttestationAggregationStrategy defines aggregation strategy to be used when aggregating.
+
+	// KeystoreImportDebounceInterval specifies the time duration the validator waits to reload new keys if they have
+	// changed on disk. This feature is for advanced use cases only.
+	KeystoreImportDebounceInterval time.Duration
 }
 
 var featureConfig *Flags
+var featureConfigLock sync.RWMutex
 
 // Get retrieves feature config.
 func Get() *Flags {
+	featureConfigLock.RLock()
+	defer featureConfigLock.RUnlock()
+
 	if featureConfig == nil {
 		return &Flags{}
 	}
@@ -88,16 +87,43 @@ func Get() *Flags {
 
 // Init sets the global config equal to the config that is passed in.
 func Init(c *Flags) {
+	featureConfigLock.Lock()
+	defer featureConfigLock.Unlock()
+
 	featureConfig = c
 }
 
 // InitWithReset sets the global config and returns function that is used to reset configuration.
 func InitWithReset(c *Flags) func() {
+	var prevConfig Flags
+	if featureConfig != nil {
+		prevConfig = *featureConfig
+	} else {
+		prevConfig = Flags{}
+	}
 	resetFunc := func() {
-		Init(&Flags{})
+		Init(&prevConfig)
 	}
 	Init(c)
 	return resetFunc
+}
+
+// configureTestnet sets the config according to specified testnet flag
+func configureTestnet(ctx *cli.Context, cfg *Flags) {
+	if ctx.Bool(ToledoTestnet.Name) {
+		log.Warn("Running on Toledo Testnet")
+		params.UseToledoConfig()
+		params.UseToledoNetworkConfig()
+		cfg.ToledoTestnet = true
+	} else if ctx.Bool(PyrmontTestnet.Name) {
+		log.Warn("Running on Pyrmont Testnet")
+		params.UsePyrmontConfig()
+		params.UsePyrmontNetworkConfig()
+		cfg.PyrmontTestnet = true
+	} else {
+		log.Warn("Running on ETH2 Mainnet")
+		params.UseMainnetConfig()
+	}
 }
 
 // ConfigureBeaconChain sets the global config based
@@ -108,117 +134,55 @@ func ConfigureBeaconChain(ctx *cli.Context) {
 	if ctx.Bool(devModeFlag.Name) {
 		enableDevModeFlags(ctx)
 	}
-	if ctx.Bool(altonaTestnet.Name) {
-		log.Warn("Running Node on Altona Testnet")
-		params.UseAltonaConfig()
-		params.UseAltonaNetworkConfig()
-		cfg.AltonaTestnet = true
-	}
+	configureTestnet(ctx, cfg)
+
 	if ctx.Bool(writeSSZStateTransitionsFlag.Name) {
-		log.Warn("Writing SSZ states and blocks after state transitions")
+		log.WithField(writeSSZStateTransitionsFlag.Name, writeSSZStateTransitionsFlag.Usage).Warn(enabledFeatureFlag)
 		cfg.WriteSSZStateTransitions = true
 	}
-	if ctx.Bool(disableForkChoiceUnsafeFlag.Name) {
-		log.Warn("UNSAFE: Disabled fork choice for updating chain head")
-		cfg.DisableForkChoice = true
-	}
-	if ctx.Bool(disableDynamicCommitteeSubnets.Name) {
-		log.Warn("Disabled dynamic attestation committee subnets")
-		cfg.DisableDynamicCommitteeSubnets = true
-	}
+
 	cfg.EnableSSZCache = true
-	if ctx.Bool(disableSSZCache.Name) {
-		log.Warn("Disabled ssz cache")
-		cfg.EnableSSZCache = false
-	}
-	if ctx.Bool(initSyncVerifyEverythingFlag.Name) {
-		log.Warn("Initial syncing with verifying all block's content signatures.")
-		cfg.InitSyncNoVerify = false
-	} else {
-		cfg.InitSyncNoVerify = true
-	}
-	if ctx.Bool(skipBLSVerifyFlag.Name) {
-		log.Warn("UNSAFE: Skipping BLS verification at runtime")
-		cfg.SkipBLSVerify = true
-	}
-	if ctx.Bool(enableBackupWebhookFlag.Name) {
-		log.Warn("Allowing database backups to be triggered from HTTP webhook.")
-		cfg.EnableBackupWebhook = true
-	}
+
 	if ctx.String(kafkaBootstrapServersFlag.Name) != "" {
-		log.Warn("Enabling experimental kafka streaming.")
+		log.WithField(kafkaBootstrapServersFlag.Name, kafkaBootstrapServersFlag.Usage).Warn(enabledFeatureFlag)
 		cfg.KafkaBootstrapServers = ctx.String(kafkaBootstrapServersFlag.Name)
 	}
-	if ctx.Bool(enableSlasherFlag.Name) {
-		log.Warn("Enable slasher connection.")
-		cfg.EnableSlasherConnection = true
-	}
-	if ctx.Bool(cacheFilteredBlockTreeFlag.Name) {
-		log.Warn("Enabled filtered block tree cache for fork choice.")
-		cfg.EnableBlockTreeCache = true
-	}
-	if ctx.Bool(disableStrictAttestationPubsubVerificationFlag.Name) {
-		log.Warn("Disabled strict attestation signature verification in pubsub")
-		cfg.DisableStrictAttestationPubsubVerification = true
-	}
-	if ctx.Bool(disableUpdateHeadPerAttestation.Name) {
-		log.Warn("Disabled update head on per attestation basis")
-		cfg.DisableUpdateHeadPerAttestation = true
-	}
-	if ctx.Bool(enableStateGenSigVerify.Name) {
-		log.Warn("Enabling sig verify for state gen")
-		cfg.EnableStateGenSigVerify = true
-	}
-	if ctx.Bool(checkHeadState.Name) {
-		log.Warn("Enabling check head state for chainservice")
-		cfg.CheckHeadState = true
-	}
-	cfg.EnableNoise = true
-	if ctx.Bool(disableNoiseHandshake.Name) {
-		log.Warn("Disabling noise handshake for peer")
-		cfg.EnableNoise = false
-	}
-	if ctx.Bool(dontPruneStateStartUp.Name) {
-		log.Warn("Not enabling state pruning upon start up")
-		cfg.DontPruneStateStartUp = true
-	}
-	cfg.NewStateMgmt = true
-	if ctx.Bool(disableNewStateMgmt.Name) {
-		log.Warn("Disabling new state management service")
-		cfg.NewStateMgmt = false
-	}
-	if ctx.Bool(disableBroadcastSlashingFlag.Name) {
-		log.Warn("Disabling slashing broadcasting to p2p network")
-		cfg.DisableBroadcastSlashings = true
-	}
-	if ctx.Bool(skipRegenHistoricalStates.Name) {
-		log.Warn("Enabling skipping of historical states regen")
-		cfg.SkipRegenHistoricalStates = true
-	}
-	if ctx.IsSet(deprecatedP2PWhitelist.Name) {
-		log.Warnf("--%s is deprecated, please use --%s", deprecatedP2PWhitelist.Name, cmd.P2PAllowList.Name)
-		if err := ctx.Set(cmd.P2PAllowList.Name, ctx.String(deprecatedP2PWhitelist.Name)); err != nil {
-			log.WithError(err).Error("Failed to update P2PAllowList flag")
-		}
-	}
-	if ctx.IsSet(deprecatedP2PBlacklist.Name) {
-		log.Warnf("--%s is deprecated, please use --%s", deprecatedP2PBlacklist.Name, cmd.P2PDenyList.Name)
-		if err := ctx.Set(cmd.P2PDenyList.Name, ctx.String(deprecatedP2PBlacklist.Name)); err != nil {
-			log.WithError(err).Error("Failed to update P2PDenyList flag")
-		}
-	}
-	cfg.ReduceAttesterStateCopy = true
-	if ctx.Bool(disableReduceAttesterStateCopy.Name) {
-		log.Warn("Disabling reducing attester state copy")
-		cfg.ReduceAttesterStateCopy = false
-	}
 	if ctx.IsSet(disableGRPCConnectionLogging.Name) {
+		log.WithField(disableGRPCConnectionLogging.Name, disableGRPCConnectionLogging.Usage).Warn(enabledFeatureFlag)
 		cfg.DisableGRPCConnectionLogs = true
 	}
 	cfg.AttestationAggregationStrategy = ctx.String(attestationAggregationStrategy.Name)
-	if ctx.Bool(forceMaxCoverAttestationAggregation.Name) {
-		log.Warn("Forcing max_cover strategy on attestation aggregation")
-		cfg.AttestationAggregationStrategy = "max_cover"
+	if ctx.Bool(forceOptMaxCoverAggregationStategy.Name) {
+		log.WithField(forceOptMaxCoverAggregationStategy.Name, forceOptMaxCoverAggregationStategy.Usage).Warn(enabledFeatureFlag)
+		cfg.AttestationAggregationStrategy = "opt_max_cover"
+	}
+	if ctx.Bool(enablePeerScorer.Name) {
+		log.WithField(enablePeerScorer.Name, enablePeerScorer.Usage).Warn(enabledFeatureFlag)
+		cfg.EnablePeerScorer = true
+	}
+	if ctx.Bool(checkPtInfoCache.Name) {
+		log.Warn("Advance check point info cache is no longer supported and will soon be deleted")
+	}
+	cfg.EnableBlst = true
+	if ctx.Bool(disableBlst.Name) {
+		log.WithField(disableBlst.Name, disableBlst.Usage).Warn(enabledFeatureFlag)
+		cfg.EnableBlst = false
+	}
+	if ctx.Bool(enableLargerGossipHistory.Name) {
+		log.WithField(enableLargerGossipHistory.Name, enableLargerGossipHistory.Usage).Warn(enabledFeatureFlag)
+		cfg.EnableLargerGossipHistory = true
+	}
+	if ctx.Bool(disableBroadcastSlashingFlag.Name) {
+		log.WithField(disableBroadcastSlashingFlag.Name, disableBroadcastSlashingFlag.Usage).Warn(enabledFeatureFlag)
+		cfg.DisableBroadcastSlashings = true
+	}
+	if ctx.Bool(enableNextSlotStateCache.Name) {
+		log.WithField(enableNextSlotStateCache.Name, enableNextSlotStateCache.Usage).Warn(enabledFeatureFlag)
+		cfg.EnableNextSlotStateCache = true
+	}
+	if ctx.Bool(updateHeadTimely.Name) {
+		log.WithField(updateHeadTimely.Name, updateHeadTimely.Usage).Warn(enabledFeatureFlag)
+		cfg.UpdateHeadTimely = true
 	}
 	Init(cfg)
 }
@@ -228,12 +192,10 @@ func ConfigureBeaconChain(ctx *cli.Context) {
 func ConfigureSlasher(ctx *cli.Context) {
 	complainOnDeprecatedFlags(ctx)
 	cfg := &Flags{}
-	if ctx.Bool(enableHistoricalDetectionFlag.Name) {
-		log.Warn("Enabling historical attestation detection")
-		cfg.EnableHistoricalDetection = true
-	}
+	configureTestnet(ctx, cfg)
+
 	if ctx.Bool(disableLookbackFlag.Name) {
-		log.Warn("Disabling slasher lookback")
+		log.WithField(disableLookbackFlag.Name, disableLookbackFlag.Usage).Warn(enabledFeatureFlag)
 		cfg.DisableLookback = true
 	}
 	Init(cfg)
@@ -244,25 +206,29 @@ func ConfigureSlasher(ctx *cli.Context) {
 func ConfigureValidator(ctx *cli.Context) {
 	complainOnDeprecatedFlags(ctx)
 	cfg := &Flags{}
-	if ctx.Bool(altonaTestnet.Name) {
-		log.Warn("Running Validator on Altona Testnet")
-		params.UseAltonaConfig()
-		params.UseAltonaNetworkConfig()
-		cfg.AltonaTestnet = true
-	}
-	if ctx.Bool(enableLocalProtectionFlag.Name) {
-		log.Warn("Enabled validator slashing protection.")
-		cfg.LocalProtection = true
-	}
+	configureTestnet(ctx, cfg)
 	if ctx.Bool(enableExternalSlasherProtectionFlag.Name) {
-		log.Warn("Enabled validator attestation and block slashing protection using an external slasher.")
+		log.WithField(enableExternalSlasherProtectionFlag.Name, enableExternalSlasherProtectionFlag.Usage).Warn(enabledFeatureFlag)
 		cfg.SlasherProtection = true
 	}
-	cfg.EnableDomainDataCache = true
-	if ctx.Bool(disableDomainDataCacheFlag.Name) {
-		log.Warn("Disabled domain data cache.")
-		cfg.EnableDomainDataCache = false
+	if ctx.Bool(writeWalletPasswordOnWebOnboarding.Name) {
+		log.WithField(writeWalletPasswordOnWebOnboarding.Name, writeWalletPasswordOnWebOnboarding.Usage).Warn(enabledFeatureFlag)
+		cfg.WriteWalletPasswordOnWebOnboarding = true
 	}
+	if ctx.Bool(disableAttestingHistoryDBCache.Name) {
+		log.WithField(disableAttestingHistoryDBCache.Name, disableAttestingHistoryDBCache.Usage).Warn(enabledFeatureFlag)
+		cfg.DisableAttestingHistoryDBCache = true
+	}
+	cfg.EnableBlst = true
+	if ctx.Bool(disableBlst.Name) {
+		log.WithField(disableBlst.Name, disableBlst.Usage).Warn(enabledFeatureFlag)
+		cfg.EnableBlst = false
+	}
+	if ctx.Bool(attestTimely.Name) {
+		log.WithField(attestTimely.Name, attestTimely.Usage).Warn(enabledFeatureFlag)
+		cfg.AttestTimely = true
+	}
+	cfg.KeystoreImportDebounceInterval = ctx.Duration(dynamicKeyReloadDebounceInterval.Name)
 	Init(cfg)
 }
 

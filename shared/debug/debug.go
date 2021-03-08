@@ -68,6 +68,16 @@ var (
 		Usage: "Turn on memory profiling with the given rate",
 		Value: runtime.MemProfileRate,
 	}
+	// MutexProfileFractionFlag to specify the mutex profiling rate.
+	MutexProfileFractionFlag = &cli.IntFlag{
+		Name:  "mutexprofilefraction",
+		Usage: "Turn on mutex profiling with the given rate",
+	}
+	// BlockProfileRateFlag to specify the block profiling rate.
+	BlockProfileRateFlag = &cli.IntFlag{
+		Name:  "blockprofilerate",
+		Usage: "Turn on block profiling with the given rate",
+	}
 	// CPUProfileFlag to specify where to write the CPU profile.
 	CPUProfileFlag = &cli.StringFlag{
 		Name:  "cpuprofile",
@@ -305,32 +315,6 @@ func expandHome(p string) string {
 	return filepath.Clean(p)
 }
 
-// MigrateFlags sets the global flag from a local flag when it's set.
-// This is a temporary function used for migrating old command/flags to the
-// new format.
-//
-// e.g. geth account new --keystore /tmp/mykeystore --lightkdf
-//
-// is equivalent after calling this method with:
-//
-// geth --keystore /tmp/mykeystore --lightkdf account new
-//
-// This allows the use of the existing configuration functionality.
-// When all flags are migrated this function can be removed and the existing
-// configuration functionality must be changed that is uses local flags
-func MigrateFlags(action func(ctx *cli.Context) error) func(*cli.Context) error {
-	return func(ctx *cli.Context) error {
-		for _, name := range ctx.FlagNames() {
-			if ctx.IsSet(name) {
-				if err := ctx.Set(name, ctx.String(name)); err != nil {
-					return err
-				}
-			}
-		}
-		return action(ctx)
-	}
-}
-
 // Debug setup and exit functions.
 
 // Setup initializes profiling based on the CLI flags.
@@ -338,6 +322,12 @@ func MigrateFlags(action func(ctx *cli.Context) error) func(*cli.Context) error 
 func Setup(ctx *cli.Context) error {
 	// profiling, tracing
 	runtime.MemProfileRate = ctx.Int(MemProfileRateFlag.Name)
+	if ctx.IsSet(BlockProfileRateFlag.Name) {
+		runtime.SetBlockProfileRate(ctx.Int(BlockProfileRateFlag.Name))
+	}
+	if ctx.IsSet(MutexProfileFractionFlag.Name) {
+		runtime.SetMutexProfileFraction(ctx.Int(MutexProfileFractionFlag.Name))
+	}
 	if traceFile := ctx.String(TraceFlag.Name); traceFile != "" {
 		if err := Handler.StartGoTrace(TraceFlag.Name); err != nil {
 			return err

@@ -1,6 +1,7 @@
 package attestations
 
 import (
+	types "github.com/prysmaticlabs/eth2-types"
 	ethpb "github.com/prysmaticlabs/ethereumapis/eth/v1alpha1"
 	"github.com/prysmaticlabs/prysm/beacon-chain/operations/attestations/kv"
 )
@@ -12,19 +13,21 @@ import (
 type Pool interface {
 	// For Aggregated attestations
 	AggregateUnaggregatedAttestations() error
+	AggregateUnaggregatedAttestationsBySlotIndex(slot types.Slot, committeeIndex types.CommitteeIndex) error
 	SaveAggregatedAttestation(att *ethpb.Attestation) error
 	SaveAggregatedAttestations(atts []*ethpb.Attestation) error
 	AggregatedAttestations() []*ethpb.Attestation
-	AggregatedAttestationsBySlotIndex(slot uint64, committeeIndex uint64) []*ethpb.Attestation
+	AggregatedAttestationsBySlotIndex(slot types.Slot, committeeIndex types.CommitteeIndex) []*ethpb.Attestation
 	DeleteAggregatedAttestation(att *ethpb.Attestation) error
 	HasAggregatedAttestation(att *ethpb.Attestation) (bool, error)
 	AggregatedAttestationCount() int
 	// For unaggregated attestations.
 	SaveUnaggregatedAttestation(att *ethpb.Attestation) error
 	SaveUnaggregatedAttestations(atts []*ethpb.Attestation) error
-	UnaggregatedAttestations() []*ethpb.Attestation
-	UnaggregatedAttestationsBySlotIndex(slot uint64, committeeIndex uint64) []*ethpb.Attestation
+	UnaggregatedAttestations() ([]*ethpb.Attestation, error)
+	UnaggregatedAttestationsBySlotIndex(slot types.Slot, committeeIndex types.CommitteeIndex) []*ethpb.Attestation
 	DeleteUnaggregatedAttestation(att *ethpb.Attestation) error
+	DeleteSeenUnaggregatedAttestations() (int, error)
 	UnaggregatedAttestationCount() int
 	// For attestations that were included in the block.
 	SaveBlockAttestation(att *ethpb.Attestation) error
@@ -36,6 +39,7 @@ type Pool interface {
 	SaveForkchoiceAttestations(atts []*ethpb.Attestation) error
 	ForkchoiceAttestations() []*ethpb.Attestation
 	DeleteForkchoiceAttestation(att *ethpb.Attestation) error
+	ForkchoiceAttestationCount() int
 }
 
 // NewPool initializes a new attestation pool.

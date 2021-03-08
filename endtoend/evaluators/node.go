@@ -12,9 +12,11 @@ import (
 
 	ptypes "github.com/gogo/protobuf/types"
 	"github.com/pkg/errors"
+	types "github.com/prysmaticlabs/eth2-types"
 	eth "github.com/prysmaticlabs/ethereumapis/eth/v1alpha1"
 	e2e "github.com/prysmaticlabs/prysm/endtoend/params"
-	"github.com/prysmaticlabs/prysm/endtoend/types"
+	"github.com/prysmaticlabs/prysm/endtoend/policies"
+	e2etypes "github.com/prysmaticlabs/prysm/endtoend/types"
 	"google.golang.org/grpc"
 )
 
@@ -22,38 +24,32 @@ import (
 var connTimeDelay = 50 * time.Millisecond
 
 // PeersConnect checks all beacon nodes and returns whether they are connected to each other as peers.
-var PeersConnect = types.Evaluator{
+var PeersConnect = e2etypes.Evaluator{
 	Name:       "peers_connect_epoch_%d",
-	Policy:     onEpoch(0),
+	Policy:     policies.OnEpoch(0),
 	Evaluation: peersConnect,
 }
 
 // HealthzCheck pings healthz and errors if it doesn't have the expected OK status.
-var HealthzCheck = types.Evaluator{
+var HealthzCheck = e2etypes.Evaluator{
 	Name:       "healthz_check_epoch_%d",
-	Policy:     afterNthEpoch(0),
+	Policy:     policies.AfterNthEpoch(0),
 	Evaluation: healthzCheck,
 }
 
 // FinishedSyncing returns whether the beacon node with the given rpc port has finished syncing.
-var FinishedSyncing = types.Evaluator{
+var FinishedSyncing = e2etypes.Evaluator{
 	Name:       "finished_syncing",
-	Policy:     func(currentEpoch uint64) bool { return true },
+	Policy:     policies.AllEpochs,
 	Evaluation: finishedSyncing,
 }
 
 // AllNodesHaveSameHead ensures all nodes have the same head epoch. Checks finality and justification as well.
 // Not checking head block root as it may change irregularly for the validator connected nodes.
-var AllNodesHaveSameHead = types.Evaluator{
+var AllNodesHaveSameHead = e2etypes.Evaluator{
 	Name:       "all_nodes_have_same_head",
-	Policy:     func(currentEpoch uint64) bool { return true },
+	Policy:     policies.AllEpochs,
 	Evaluation: allNodesHaveSameHead,
-}
-
-func onEpoch(epoch uint64) func(uint64) bool {
-	return func(currentEpoch uint64) bool {
-		return currentEpoch == epoch
-	}
 }
 
 func healthzCheck(conns ...*grpc.ClientConn) error {
@@ -61,7 +57,8 @@ func healthzCheck(conns ...*grpc.ClientConn) error {
 	for i := 0; i < count; i++ {
 		resp, err := http.Get(fmt.Sprintf("http://localhost:%d/healthz", e2e.TestParams.BeaconNodeMetricsPort+i))
 		if err != nil {
-			return errors.Wrapf(err, "could not connect to beacon node %d", i)
+			// Continue if the connection fails, regular flake.
+			continue
 		}
 		if resp.StatusCode != http.StatusOK {
 			body, err := ioutil.ReadAll(resp.Body)
@@ -70,14 +67,17 @@ func healthzCheck(conns ...*grpc.ClientConn) error {
 			}
 			return fmt.Errorf("expected status code OK for beacon node %d, received %v with body %s", i, resp.StatusCode, body)
 		}
-		if err := resp.Body.Close(); err != nil {
+		if err = resp.Body.Close(); err != nil {
 			return err
 		}
 		time.Sleep(connTimeDelay)
+	}
 
-		resp, err = http.Get(fmt.Sprintf("http://localhost:%d/healthz", e2e.TestParams.ValidatorMetricsPort+i))
+	for i := 0; i < count; i++ {
+		resp, err := http.Get(fmt.Sprintf("http://localhost:%d/healthz", e2e.TestParams.ValidatorMetricsPort+i))
 		if err != nil {
-			return errors.Wrapf(err, "could not connect to validator client %d", i)
+			// Continue if the connection fails, regular flake.
+			continue
 		}
 		if resp.StatusCode != http.StatusOK {
 			body, err := ioutil.ReadAll(resp.Body)
@@ -86,7 +86,7 @@ func healthzCheck(conns ...*grpc.ClientConn) error {
 			}
 			return fmt.Errorf("expected status code OK for validator client %d, received %v with body %s", i, resp.StatusCode, body)
 		}
-		if err := resp.Body.Close(); err != nil {
+		if err = resp.Body.Close(); err != nil {
 			return err
 		}
 		time.Sleep(connTimeDelay)
@@ -128,7 +128,7 @@ func finishedSyncing(conns ...*grpc.ClientConn) error {
 }
 
 func allNodesHaveSameHead(conns ...*grpc.ClientConn) error {
-	headEpochs := make([]uint64, len(conns))
+	headEpochs := make([]types.Epoch, len(conns))
 	justifiedRoots := make([][]byte, len(conns))
 	prevJustifiedRoots := make([][]byte, len(conns))
 	finalizedRoots := make([][]byte, len(conns))

@@ -3,10 +3,13 @@ package helpers
 import (
 	"testing"
 
+	types "github.com/prysmaticlabs/eth2-types"
 	ethpb "github.com/prysmaticlabs/ethereumapis/eth/v1alpha1"
 	beaconstate "github.com/prysmaticlabs/prysm/beacon-chain/state"
 	pb "github.com/prysmaticlabs/prysm/proto/beacon/p2p/v1"
 	"github.com/prysmaticlabs/prysm/shared/params"
+	"github.com/prysmaticlabs/prysm/shared/testutil/assert"
+	"github.com/prysmaticlabs/prysm/shared/testutil/require"
 )
 
 func TestTotalBalance_OK(t *testing.T) {
@@ -14,31 +17,21 @@ func TestTotalBalance_OK(t *testing.T) {
 		{EffectiveBalance: 27 * 1e9}, {EffectiveBalance: 28 * 1e9},
 		{EffectiveBalance: 32 * 1e9}, {EffectiveBalance: 40 * 1e9},
 	}})
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 
-	balance := TotalBalance(state, []uint64{0, 1, 2, 3})
+	balance := TotalBalance(state, []types.ValidatorIndex{0, 1, 2, 3})
 	wanted := state.Validators()[0].EffectiveBalance + state.Validators()[1].EffectiveBalance +
 		state.Validators()[2].EffectiveBalance + state.Validators()[3].EffectiveBalance
-
-	if balance != wanted {
-		t.Errorf("Incorrect TotalBalance. Wanted: %d, got: %d", wanted, balance)
-	}
+	assert.Equal(t, wanted, balance, "Incorrect TotalBalance")
 }
 
 func TestTotalBalance_ReturnsEffectiveBalanceIncrement(t *testing.T) {
 	state, err := beaconstate.InitializeFromProto(&pb.BeaconState{Validators: []*ethpb.Validator{}})
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 
-	balance := TotalBalance(state, []uint64{})
+	balance := TotalBalance(state, []types.ValidatorIndex{})
 	wanted := params.BeaconConfig().EffectiveBalanceIncrement
-
-	if balance != wanted {
-		t.Errorf("Incorrect TotalBalance. Wanted: %d, got: %d", wanted, balance)
-	}
+	assert.Equal(t, wanted, balance, "Incorrect TotalBalance")
 }
 
 func TestTotalActiveBalance_OK(t *testing.T) {
@@ -60,20 +53,13 @@ func TestTotalActiveBalance_OK(t *testing.T) {
 			ExitEpoch:        params.BeaconConfig().FarFutureEpoch,
 		},
 	}})
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 
 	balance, err := TotalActiveBalance(state)
-	if err != nil {
-		t.Error(err)
-	}
+	assert.NoError(t, err)
 	wanted := state.Validators()[0].EffectiveBalance + state.Validators()[1].EffectiveBalance +
 		state.Validators()[2].EffectiveBalance + state.Validators()[3].EffectiveBalance
-
-	if balance != wanted {
-		t.Errorf("Incorrect TotalActiveBalance. Wanted: %d, got: %d", wanted, balance)
-	}
+	assert.Equal(t, wanted, balance, "Incorrect TotalActiveBalance")
 }
 
 func TestGetBalance_OK(t *testing.T) {
@@ -89,18 +75,14 @@ func TestGetBalance_OK(t *testing.T) {
 	}
 	for _, test := range tests {
 		state, err := beaconstate.InitializeFromProto(&pb.BeaconState{Balances: test.b})
-		if err != nil {
-			t.Fatal(err)
-		}
-		if state.Balances()[test.i] != test.b[test.i] {
-			t.Errorf("Incorrect Validator balance. Wanted: %d, got: %d", test.b[test.i], state.Balances()[test.i])
-		}
+		require.NoError(t, err)
+		assert.Equal(t, test.b[test.i], state.Balances()[test.i], "Incorrect Validator balance")
 	}
 }
 
 func TestIncreaseBalance_OK(t *testing.T) {
 	tests := []struct {
-		i  uint64
+		i  types.ValidatorIndex
 		b  []uint64
 		nb uint64
 		eb uint64
@@ -115,21 +97,15 @@ func TestIncreaseBalance_OK(t *testing.T) {
 				{EffectiveBalance: 4}, {EffectiveBalance: 4}, {EffectiveBalance: 4}},
 			Balances: test.b,
 		})
-		if err != nil {
-			t.Fatal(err)
-		}
-		if err := IncreaseBalance(state, test.i, test.nb); err != nil {
-			t.Fatal(err)
-		}
-		if state.Balances()[test.i] != test.eb {
-			t.Errorf("Incorrect Validator balance. Wanted: %d, got: %d", test.eb, state.Balances()[test.i])
-		}
+		require.NoError(t, err)
+		require.NoError(t, IncreaseBalance(state, test.i, test.nb))
+		assert.Equal(t, test.eb, state.Balances()[test.i], "Incorrect Validator balance")
 	}
 }
 
 func TestDecreaseBalance_OK(t *testing.T) {
 	tests := []struct {
-		i  uint64
+		i  types.ValidatorIndex
 		b  []uint64
 		nb uint64
 		eb uint64
@@ -145,14 +121,8 @@ func TestDecreaseBalance_OK(t *testing.T) {
 				{EffectiveBalance: 4}, {EffectiveBalance: 4}, {EffectiveBalance: 4}, {EffectiveBalance: 3}},
 			Balances: test.b,
 		})
-		if err != nil {
-			t.Fatal(err)
-		}
-		if err := DecreaseBalance(state, test.i, test.nb); err != nil {
-			t.Fatal(err)
-		}
-		if state.Balances()[test.i] != test.eb {
-			t.Errorf("Incorrect Validator balance. Wanted: %d, got: %d", test.eb, state.Balances()[test.i])
-		}
+		require.NoError(t, err)
+		require.NoError(t, DecreaseBalance(state, test.i, test.nb))
+		assert.Equal(t, test.eb, state.Balances()[test.i], "Incorrect Validator balance")
 	}
 }

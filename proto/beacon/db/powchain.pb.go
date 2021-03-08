@@ -1240,10 +1240,7 @@ func (m *ETH1ChainData) Unmarshal(dAtA []byte) error {
 			if err != nil {
 				return err
 			}
-			if skippy < 0 {
-				return ErrInvalidLengthPowchain
-			}
-			if (iNdEx + skippy) < 0 {
+			if (skippy < 0) || (iNdEx+skippy) < 0 {
 				return ErrInvalidLengthPowchain
 			}
 			if (iNdEx + skippy) > l {
@@ -1385,10 +1382,7 @@ func (m *LatestETH1Data) Unmarshal(dAtA []byte) error {
 			if err != nil {
 				return err
 			}
-			if skippy < 0 {
-				return ErrInvalidLengthPowchain
-			}
-			if (iNdEx + skippy) < 0 {
+			if (skippy < 0) || (iNdEx+skippy) < 0 {
 				return ErrInvalidLengthPowchain
 			}
 			if (iNdEx + skippy) > l {
@@ -1567,10 +1561,7 @@ func (m *ChainStartData) Unmarshal(dAtA []byte) error {
 			if err != nil {
 				return err
 			}
-			if skippy < 0 {
-				return ErrInvalidLengthPowchain
-			}
-			if (iNdEx + skippy) < 0 {
+			if (skippy < 0) || (iNdEx+skippy) < 0 {
 				return ErrInvalidLengthPowchain
 			}
 			if (iNdEx + skippy) > l {
@@ -1706,10 +1697,7 @@ func (m *SparseMerkleTrie) Unmarshal(dAtA []byte) error {
 			if err != nil {
 				return err
 			}
-			if skippy < 0 {
-				return ErrInvalidLengthPowchain
-			}
-			if (iNdEx + skippy) < 0 {
+			if (skippy < 0) || (iNdEx+skippy) < 0 {
 				return ErrInvalidLengthPowchain
 			}
 			if (iNdEx + skippy) > l {
@@ -1792,10 +1780,7 @@ func (m *TrieLayer) Unmarshal(dAtA []byte) error {
 			if err != nil {
 				return err
 			}
-			if skippy < 0 {
-				return ErrInvalidLengthPowchain
-			}
-			if (iNdEx + skippy) < 0 {
+			if (skippy < 0) || (iNdEx+skippy) < 0 {
 				return ErrInvalidLengthPowchain
 			}
 			if (iNdEx + skippy) > l {
@@ -1954,10 +1939,7 @@ func (m *DepositContainer) Unmarshal(dAtA []byte) error {
 			if err != nil {
 				return err
 			}
-			if skippy < 0 {
-				return ErrInvalidLengthPowchain
-			}
-			if (iNdEx + skippy) < 0 {
+			if (skippy < 0) || (iNdEx+skippy) < 0 {
 				return ErrInvalidLengthPowchain
 			}
 			if (iNdEx + skippy) > l {

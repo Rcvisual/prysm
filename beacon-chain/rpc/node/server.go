@@ -17,6 +17,8 @@ import (
 	"github.com/prysmaticlabs/prysm/beacon-chain/db"
 	"github.com/prysmaticlabs/prysm/beacon-chain/p2p"
 	"github.com/prysmaticlabs/prysm/beacon-chain/sync"
+	pb "github.com/prysmaticlabs/prysm/proto/beacon/rpc/v1"
+	"github.com/prysmaticlabs/prysm/shared/logutil"
 	"github.com/prysmaticlabs/prysm/shared/version"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -27,17 +29,21 @@ import (
 // providing RPC endpoints for verifying a beacon node's sync status, genesis and
 // version information, and services the node implements and runs.
 type Server struct {
-	SyncChecker        sync.Checker
-	Server             *grpc.Server
-	BeaconDB           db.ReadOnlyDatabase
-	PeersFetcher       p2p.PeersProvider
-	PeerManager        p2p.PeerManager
-	GenesisTimeFetcher blockchain.TimeFetcher
-	GenesisFetcher     blockchain.GenesisFetcher
+	LogsStreamer         logutil.Streamer
+	StreamLogsBufferSize int
+	SyncChecker          sync.Checker
+	Server               *grpc.Server
+	BeaconDB             db.ReadOnlyDatabase
+	PeersFetcher         p2p.PeersProvider
+	PeerManager          p2p.PeerManager
+	GenesisTimeFetcher   blockchain.TimeFetcher
+	GenesisFetcher       blockchain.GenesisFetcher
+	BeaconMonitoringHost string
+	BeaconMonitoringPort int
 }
 
 // GetSyncStatus checks the current network sync status of the node.
-func (ns *Server) GetSyncStatus(ctx context.Context, _ *ptypes.Empty) (*ethpb.SyncStatus, error) {
+func (ns *Server) GetSyncStatus(_ context.Context, _ *ptypes.Empty) (*ethpb.SyncStatus, error) {
 	return &ethpb.SyncStatus{
 		Syncing: ns.SyncChecker.Syncing(),
 	}, nil
@@ -71,9 +77,9 @@ func (ns *Server) GetGenesis(ctx context.Context, _ *ptypes.Empty) (*ethpb.Genes
 }
 
 // GetVersion checks the version information of the beacon node.
-func (ns *Server) GetVersion(ctx context.Context, _ *ptypes.Empty) (*ethpb.Version, error) {
+func (ns *Server) GetVersion(_ context.Context, _ *ptypes.Empty) (*ethpb.Version, error) {
 	return &ethpb.Version{
-		Version: version.GetVersion(),
+		Version: version.Version(),
 	}, nil
 }
 
@@ -82,7 +88,7 @@ func (ns *Server) GetVersion(ctx context.Context, _ *ptypes.Empty) (*ethpb.Versi
 // Any service not present in this list may return UNIMPLEMENTED or
 // PERMISSION_DENIED. The server may also support fetching services by grpc
 // reflection.
-func (ns *Server) ListImplementedServices(ctx context.Context, _ *ptypes.Empty) (*ethpb.ImplementedServices, error) {
+func (ns *Server) ListImplementedServices(_ context.Context, _ *ptypes.Empty) (*ethpb.ImplementedServices, error) {
 	serviceInfo := ns.Server.GetServiceInfo()
 	serviceNames := make([]string, 0, len(serviceInfo))
 	for svc := range serviceInfo {
@@ -95,14 +101,14 @@ func (ns *Server) ListImplementedServices(ctx context.Context, _ *ptypes.Empty) 
 }
 
 // GetHost returns the p2p data on the current local and host peer.
-func (ns *Server) GetHost(ctx context.Context, _ *ptypes.Empty) (*ethpb.HostData, error) {
-	stringAddr := []string{}
+func (ns *Server) GetHost(_ context.Context, _ *ptypes.Empty) (*ethpb.HostData, error) {
+	var stringAddr []string
 	for _, addr := range ns.PeerManager.Host().Addrs() {
 		stringAddr = append(stringAddr, addr.String())
 	}
 	record := ns.PeerManager.ENR()
 	enr := ""
-	err := error(nil)
+	var err error
 	if record != nil {
 		enr, err = p2p.SerializeENR(record)
 		if err != nil {
@@ -118,7 +124,7 @@ func (ns *Server) GetHost(ctx context.Context, _ *ptypes.Empty) (*ethpb.HostData
 }
 
 // GetPeer returns the data known about the peer defined by the provided peer id.
-func (ns *Server) GetPeer(ctx context.Context, peerReq *ethpb.PeerRequest) (*ethpb.Peer, error) {
+func (ns *Server) GetPeer(_ context.Context, peerReq *ethpb.PeerRequest) (*ethpb.Peer, error) {
 	pid, err := peer.Decode(peerReq.PeerId)
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "Unable to parse provided peer id: %v", err)
@@ -164,8 +170,12 @@ func (ns *Server) GetPeer(ctx context.Context, peerReq *ethpb.PeerRequest) (*eth
 
 // ListPeers lists the peers connected to this node.
 func (ns *Server) ListPeers(ctx context.Context, _ *ptypes.Empty) (*ethpb.Peers, error) {
-	res := make([]*ethpb.Peer, 0)
-	for _, pid := range ns.PeersFetcher.Peers().Connected() {
+	peers := ns.PeersFetcher.Peers().Connected()
+	res := make([]*ethpb.Peer, 0, len(peers))
+	for _, pid := range peers {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 		multiaddr, err := ns.PeersFetcher.Peers().Address(pid)
 		if err != nil {
 			continue
@@ -185,8 +195,11 @@ func (ns *Server) ListPeers(ctx context.Context, _ *ptypes.Empty) (*ethpb.Peers,
 				continue
 			}
 		}
-
-		address := fmt.Sprintf("%s/p2p/%s", multiaddr.String(), pid.Pretty())
+		multiAddrStr := "unknown"
+		if multiaddr != nil {
+			multiAddrStr = multiaddr.String()
+		}
+		address := fmt.Sprintf("%s/p2p/%s", multiAddrStr, pid.Pretty())
 		pbDirection := ethpb.PeerDirection_UNKNOWN
 		switch direction {
 		case network.DirInbound:
@@ -206,4 +219,40 @@ func (ns *Server) ListPeers(ctx context.Context, _ *ptypes.Empty) (*ethpb.Peers,
 	return &ethpb.Peers{
 		Peers: res,
 	}, nil
+}
+
+// StreamBeaconLogs from the beacon node via a gRPC server-side stream.
+func (ns *Server) StreamBeaconLogs(_ *ptypes.Empty, stream pb.Health_StreamBeaconLogsServer) error {
+	ch := make(chan []byte, ns.StreamLogsBufferSize)
+	sub := ns.LogsStreamer.LogsFeed().Subscribe(ch)
+	defer func() {
+		sub.Unsubscribe()
+		close(ch)
+	}()
+
+	recentLogs := ns.LogsStreamer.GetLastFewLogs()
+	logStrings := make([]string, len(recentLogs))
+	for i, log := range recentLogs {
+		logStrings[i] = string(log)
+	}
+	if err := stream.Send(&pb.LogsResponse{
+		Logs: logStrings,
+	}); err != nil {
+		return status.Errorf(codes.Unavailable, "Could not send over stream: %v", err)
+	}
+	for {
+		select {
+		case log := <-ch:
+			resp := &pb.LogsResponse{
+				Logs: []string{string(log)},
+			}
+			if err := stream.Send(resp); err != nil {
+				return status.Errorf(codes.Unavailable, "Could not send over stream: %v", err)
+			}
+		case err := <-sub.Err():
+			return status.Errorf(codes.Canceled, "Subscriber error, closing: %v", err)
+		case <-stream.Context().Done():
+			return status.Error(codes.Canceled, "Context canceled")
+		}
+	}
 }

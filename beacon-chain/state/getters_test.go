@@ -5,21 +5,21 @@ import (
 	"sync"
 	"testing"
 
+	types "github.com/prysmaticlabs/eth2-types"
+	eth "github.com/prysmaticlabs/ethereumapis/eth/v1alpha1"
 	pb "github.com/prysmaticlabs/prysm/proto/beacon/p2p/v1"
+	"github.com/prysmaticlabs/prysm/shared/testutil/assert"
+	"github.com/prysmaticlabs/prysm/shared/testutil/require"
 )
 
 func TestBeaconState_SlotDataRace(t *testing.T) {
 	headState, err := InitializeFromProto(&pb.BeaconState{Slot: 1})
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 
 	wg := sync.WaitGroup{}
 	wg.Add(2)
 	go func() {
-		if err := headState.SetSlot(uint64(0)); err != nil {
-			t.Fatal(err)
-		}
+		require.NoError(t, headState.SetSlot(0))
 		wg.Done()
 	}()
 	go func() {
@@ -48,23 +48,27 @@ func TestNilState_NoPanic(t *testing.T) {
 	_ = st.ParentRoot()
 	_ = st.BlockRoots()
 	_, err := st.BlockRootAtIndex(0)
+	_ = err
 	_ = st.StateRoots()
 	_ = st.HistoricalRoots()
 	_ = st.Eth1Data()
 	_ = st.Eth1DataVotes()
 	_ = st.Eth1DepositIndex()
-	_ = st.ValidatorsReadOnly()
 	_, err = st.ValidatorAtIndex(0)
+	_ = err
 	_, err = st.ValidatorAtIndexReadOnly(0)
+	_ = err
 	_, _ = st.ValidatorIndexByPubkey([48]byte{})
 	_ = st.validatorIndexMap()
 	_ = st.PubkeyAtIndex(0)
 	_ = st.NumValidators()
 	_ = st.Balances()
 	_, err = st.BalanceAtIndex(0)
+	_ = err
 	_ = st.BalancesLength()
 	_ = st.RandaoMixes()
 	_, err = st.RandaoMixAtIndex(0)
+	_ = err
 	_ = st.RandaoMixesLength()
 	_ = st.Slashings()
 	_ = st.PreviousEpochAttestations()
@@ -73,22 +77,41 @@ func TestNilState_NoPanic(t *testing.T) {
 	_ = st.PreviousJustifiedCheckpoint()
 	_ = st.CurrentJustifiedCheckpoint()
 	_ = st.FinalizedCheckpoint()
-	_ = err
 }
 
 func TestReadOnlyValidator_NoPanic(t *testing.T) {
 	v := &ReadOnlyValidator{}
-	if v.Slashed() == true {
-		t.Error("Expected not slashed")
-	}
-	if v.CopyValidator() != nil {
-		t.Error("Expected nil result")
-	}
+	assert.Equal(t, false, v.Slashed(), "Expected not slashed")
+	assert.Equal(t, (*eth.Validator)(nil), v.CopyValidator(), "Expected nil result")
 }
 
 func TestReadOnlyValidator_ActivationEligibilityEpochNoPanic(t *testing.T) {
 	v := &ReadOnlyValidator{}
-	if v.ActivationEligibilityEpoch() != 0 {
-		t.Error("Expected 0 and not panic")
-	}
+	assert.Equal(t, types.Epoch(0), v.ActivationEligibilityEpoch(), "Expected 0 and not panic")
+}
+
+func TestBeaconState_MatchCurrentJustifiedCheckpt(t *testing.T) {
+	c1 := &eth.Checkpoint{Epoch: 1}
+	c2 := &eth.Checkpoint{Epoch: 2}
+	state, err := InitializeFromProto(&pb.BeaconState{CurrentJustifiedCheckpoint: c1})
+	require.NoError(t, err)
+	require.Equal(t, true, state.MatchCurrentJustifiedCheckpoint(c1))
+	require.Equal(t, false, state.MatchCurrentJustifiedCheckpoint(c2))
+	require.Equal(t, false, state.MatchPreviousJustifiedCheckpoint(c1))
+	require.Equal(t, false, state.MatchPreviousJustifiedCheckpoint(c2))
+	state.state = nil
+	require.Equal(t, false, state.MatchCurrentJustifiedCheckpoint(c1))
+}
+
+func TestBeaconState_MatchPreviousJustifiedCheckpt(t *testing.T) {
+	c1 := &eth.Checkpoint{Epoch: 1}
+	c2 := &eth.Checkpoint{Epoch: 2}
+	state, err := InitializeFromProto(&pb.BeaconState{PreviousJustifiedCheckpoint: c1})
+	require.NoError(t, err)
+	require.Equal(t, false, state.MatchCurrentJustifiedCheckpoint(c1))
+	require.Equal(t, false, state.MatchCurrentJustifiedCheckpoint(c2))
+	require.Equal(t, true, state.MatchPreviousJustifiedCheckpoint(c1))
+	require.Equal(t, false, state.MatchPreviousJustifiedCheckpoint(c2))
+	state.state = nil
+	require.Equal(t, false, state.MatchPreviousJustifiedCheckpoint(c1))
 }

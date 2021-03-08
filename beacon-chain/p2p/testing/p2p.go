@@ -24,6 +24,7 @@ import (
 	ethpb "github.com/prysmaticlabs/ethereumapis/eth/v1alpha1"
 	"github.com/prysmaticlabs/prysm/beacon-chain/p2p/encoder"
 	"github.com/prysmaticlabs/prysm/beacon-chain/p2p/peers"
+	"github.com/prysmaticlabs/prysm/beacon-chain/p2p/peers/scorers"
 	pb "github.com/prysmaticlabs/prysm/proto/beacon/p2p/v1"
 	"github.com/sirupsen/logrus"
 )
@@ -33,6 +34,7 @@ type TestP2P struct {
 	t               *testing.T
 	BHost           host.Host
 	pubsub          *pubsub.PubSub
+	joinedTopics    map[string]*pubsub.Topic
 	BroadcastCalled bool
 	DelaySend       bool
 	Digest          [4]byte
@@ -52,11 +54,20 @@ func NewTestP2P(t *testing.T) *TestP2P {
 		t.Fatal(err)
 	}
 
+	peerStatuses := peers.NewStatus(context.Background(), &peers.StatusConfig{
+		PeerLimit: 30,
+		ScorerParams: &scorers.Config{
+			BadResponsesScorerConfig: &scorers.BadResponsesScorerConfig{
+				Threshold: 5,
+			},
+		},
+	})
 	return &TestP2P{
-		t:      t,
-		BHost:  h,
-		pubsub: ps,
-		peers:  peers.NewStatus(5 /* maxBadResponses */),
+		t:            t,
+		BHost:        h,
+		pubsub:       ps,
+		joinedTopics: map[string]*pubsub.Topic{},
+		peers:        peerStatuses,
 	}
 }
 
@@ -90,6 +101,8 @@ func (p *TestP2P) ReceiveRPC(topic string, msg proto.Message) {
 
 	n, err := p.Encoding().EncodeWithMaxLength(s, msg)
 	if err != nil {
+		_err := s.Reset()
+		_ = _err
 		p.t.Fatalf("Failed to encode message: %v", err)
 	}
 
@@ -122,22 +135,23 @@ func (p *TestP2P) ReceivePubSub(topic string, msg proto.Message) {
 	if err != nil {
 		p.t.Fatal(err)
 	}
-	topic = fmt.Sprintf(topic, digest)
-	topic = topic + p.Encoding().ProtocolSuffix()
-
-	if err := ps.Publish(topic, buf.Bytes()); err != nil {
+	topicHandle, err := ps.Join(fmt.Sprintf(topic, digest) + p.Encoding().ProtocolSuffix())
+	if err != nil {
+		p.t.Fatal(err)
+	}
+	if err := topicHandle.Publish(context.TODO(), buf.Bytes()); err != nil {
 		p.t.Fatalf("Failed to publish message; %v", err)
 	}
 }
 
 // Broadcast a message.
-func (p *TestP2P) Broadcast(ctx context.Context, msg proto.Message) error {
+func (p *TestP2P) Broadcast(_ context.Context, _ proto.Message) error {
 	p.BroadcastCalled = true
 	return nil
 }
 
 // BroadcastAttestation broadcasts an attestation.
-func (p *TestP2P) BroadcastAttestation(ctx context.Context, subnet uint64, att *ethpb.Attestation) error {
+func (p *TestP2P) BroadcastAttestation(_ context.Context, _ uint64, _ *ethpb.Attestation) error {
 	p.BroadcastCalled = true
 	return nil
 }
@@ -145,6 +159,49 @@ func (p *TestP2P) BroadcastAttestation(ctx context.Context, subnet uint64, att *
 // SetStreamHandler for RPC.
 func (p *TestP2P) SetStreamHandler(topic string, handler network.StreamHandler) {
 	p.BHost.SetStreamHandler(protocol.ID(topic), handler)
+}
+
+// JoinTopic will join PubSub topic, if not already joined.
+func (p *TestP2P) JoinTopic(topic string, opts ...pubsub.TopicOpt) (*pubsub.Topic, error) {
+	if _, ok := p.joinedTopics[topic]; !ok {
+		joinedTopic, err := p.pubsub.Join(topic, opts...)
+		if err != nil {
+			return nil, err
+		}
+		p.joinedTopics[topic] = joinedTopic
+	}
+
+	return p.joinedTopics[topic], nil
+}
+
+// PublishToTopic publishes message to previously joined topic.
+func (p *TestP2P) PublishToTopic(ctx context.Context, topic string, data []byte, opts ...pubsub.PubOpt) error {
+	joinedTopic, err := p.JoinTopic(topic)
+	if err != nil {
+		return err
+	}
+	return joinedTopic.Publish(ctx, data, opts...)
+}
+
+// SubscribeToTopic joins (if necessary) and subscribes to PubSub topic.
+func (p *TestP2P) SubscribeToTopic(topic string, opts ...pubsub.SubOpt) (*pubsub.Subscription, error) {
+	joinedTopic, err := p.JoinTopic(topic)
+	if err != nil {
+		return nil, err
+	}
+	return joinedTopic.Subscribe(opts...)
+}
+
+// LeaveTopic closes topic and removes corresponding handler from list of joined topics.
+// This method will return error if there are outstanding event handlers or subscriptions.
+func (p *TestP2P) LeaveTopic(topic string) error {
+	if t, ok := p.joinedTopics[topic]; ok {
+		if err := t.Close(); err != nil {
+			return err
+		}
+		delete(p.joinedTopics, topic)
+	}
+	return nil
 }
 
 // Encoding returns ssz encoding.
@@ -179,9 +236,13 @@ func (p *TestP2P) ENR() *enr.Record {
 	return new(enr.Record)
 }
 
+// DiscoveryAddresses --
+func (p *TestP2P) DiscoveryAddresses() ([]multiaddr.Multiaddr, error) {
+	return nil, nil
+}
+
 // AddConnectionHandler handles the connection with a newly connected peer.
-func (p *TestP2P) AddConnectionHandler(f func(ctx context.Context, id peer.ID) error,
-	g func(context.Context, peer.ID) error) {
+func (p *TestP2P) AddConnectionHandler(f, _ func(ctx context.Context, id peer.ID) error) {
 	p.BHost.Network().Notify(&network.NotifyBundle{
 		ConnectedF: func(net network.Network, conn network.Conn) {
 			// Must be handled in a goroutine as this callback cannot be blocking.
@@ -222,23 +283,27 @@ func (p *TestP2P) AddDisconnectionHandler(f func(ctx context.Context, id peer.ID
 
 // Send a message to a specific peer.
 func (p *TestP2P) Send(ctx context.Context, msg interface{}, topic string, pid peer.ID) (network.Stream, error) {
-	protocol := topic
-	if protocol == "" {
+	t := topic
+	if t == "" {
 		return nil, fmt.Errorf("protocol doesnt exist for proto message: %v", msg)
 	}
-	stream, err := p.BHost.NewStream(ctx, pid, core.ProtocolID(protocol+p.Encoding().ProtocolSuffix()))
+	stream, err := p.BHost.NewStream(ctx, pid, core.ProtocolID(t+p.Encoding().ProtocolSuffix()))
 	if err != nil {
 		return nil, err
 	}
 
 	if topic != "/eth2/beacon_chain/req/metadata/1" {
 		if _, err := p.Encoding().EncodeWithMaxLength(stream, msg); err != nil {
+			_err := stream.Reset()
+			_ = _err
 			return nil, err
 		}
 	}
 
 	// Close stream for writing.
-	if err := stream.Close(); err != nil {
+	if err := stream.CloseWrite(); err != nil {
+		_err := stream.Reset()
+		_ = _err
 		return nil, err
 	}
 	// Delay returning the stream for testing purposes
@@ -260,14 +325,12 @@ func (p *TestP2P) Peers() *peers.Status {
 }
 
 // FindPeersWithSubnet mocks the p2p func.
-func (p *TestP2P) FindPeersWithSubnet(index uint64) (bool, error) {
+func (p *TestP2P) FindPeersWithSubnet(_ context.Context, _ string, _, _ uint64) (bool, error) {
 	return false, nil
 }
 
 // RefreshENR mocks the p2p func.
-func (p *TestP2P) RefreshENR() {
-	return
-}
+func (p *TestP2P) RefreshENR() {}
 
 // ForkDigest mocks the p2p func.
 func (p *TestP2P) ForkDigest() ([4]byte, error) {
@@ -285,7 +348,7 @@ func (p *TestP2P) MetadataSeq() uint64 {
 }
 
 // AddPingMethod mocks the p2p func.
-func (p *TestP2P) AddPingMethod(reqFunc func(ctx context.Context, id peer.ID) error) {
+func (p *TestP2P) AddPingMethod(_ func(ctx context.Context, id peer.ID) error) {
 	// no-op
 }
 
@@ -300,7 +363,7 @@ func (p *TestP2P) InterceptAddrDial(peer.ID, multiaddr.Multiaddr) (allow bool) {
 }
 
 // InterceptAccept .
-func (p *TestP2P) InterceptAccept(n network.ConnMultiaddrs) (allow bool) {
+func (p *TestP2P) InterceptAccept(_ network.ConnMultiaddrs) (allow bool) {
 	return true
 }
 

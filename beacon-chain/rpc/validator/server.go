@@ -29,16 +29,9 @@ import (
 	pbp2p "github.com/prysmaticlabs/prysm/proto/beacon/p2p/v1"
 	"github.com/prysmaticlabs/prysm/shared/bytesutil"
 	"github.com/prysmaticlabs/prysm/shared/params"
-	"github.com/sirupsen/logrus"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
-
-var log logrus.FieldLogger
-
-func init() {
-	log = logrus.WithField("prefix", "rpc/validator")
-}
 
 // Server defines a server implementation of the gRPC Validator service,
 // providing RPC endpoints for obtaining validator assignments per epoch, the slots
@@ -57,14 +50,13 @@ type Server struct {
 	DepositFetcher         depositcache.DepositFetcher
 	ChainStartFetcher      powchain.ChainStartFetcher
 	Eth1InfoFetcher        powchain.ChainInfoFetcher
-	GenesisTimeFetcher     blockchain.TimeFetcher
 	SyncChecker            sync.Checker
 	StateNotifier          statefeed.Notifier
 	BlockNotifier          blockfeed.Notifier
 	P2P                    p2p.Broadcaster
 	AttPool                attestations.Pool
-	SlashingsPool          *slashings.Pool
-	ExitPool               *voluntaryexits.Pool
+	SlashingsPool          slashings.PoolManager
+	ExitPool               voluntaryexits.PoolManager
 	BlockReceiver          blockchain.BlockReceiver
 	MockEth1Votes          bool
 	Eth1BlockFetcher       powchain.POWBlockFetcher
@@ -131,7 +123,7 @@ func (vs *Server) ValidatorIndex(ctx context.Context, req *ethpb.ValidatorIndexR
 }
 
 // DomainData fetches the current domain version information from the beacon state.
-func (vs *Server) DomainData(ctx context.Context, request *ethpb.DomainRequest) (*ethpb.DomainResponse, error) {
+func (vs *Server) DomainData(_ context.Context, request *ethpb.DomainRequest) (*ethpb.DomainResponse, error) {
 	fork := vs.ForkFetcher.CurrentFork()
 	headGenesisValidatorRoot := vs.HeadFetcher.HeadGenesisValidatorRoot()
 	dv, err := helpers.Domain(fork, request.Epoch, bytesutil.ToBytes4(request.Domain), headGenesisValidatorRoot[:])
@@ -145,7 +137,7 @@ func (vs *Server) DomainData(ctx context.Context, request *ethpb.DomainRequest) 
 
 // CanonicalHead of the current beacon chain. This method is requested on-demand
 // by a validator when it is their time to propose or attest.
-func (vs *Server) CanonicalHead(ctx context.Context, req *ptypes.Empty) (*ethpb.SignedBeaconBlock, error) {
+func (vs *Server) CanonicalHead(ctx context.Context, _ *ptypes.Empty) (*ethpb.SignedBeaconBlock, error) {
 	headBlk, err := vs.HeadFetcher.HeadBlock(ctx)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "Could not get head block: %v", err)
@@ -157,15 +149,16 @@ func (vs *Server) CanonicalHead(ctx context.Context, req *ptypes.Empty) (*ethpb.
 // has started its runtime and validators begin their responsibilities. If it has not, it then
 // subscribes to an event stream triggered by the powchain service whenever the ChainStart log does
 // occur in the Deposit Contract on ETH 1.0.
-func (vs *Server) WaitForChainStart(req *ptypes.Empty, stream ethpb.BeaconNodeValidator_WaitForChainStartServer) error {
-	head, err := vs.HeadFetcher.HeadState(context.Background())
+func (vs *Server) WaitForChainStart(_ *ptypes.Empty, stream ethpb.BeaconNodeValidator_WaitForChainStartServer) error {
+	head, err := vs.HeadFetcher.HeadState(stream.Context())
 	if err != nil {
 		return status.Errorf(codes.Internal, "Could not retrieve head state: %v", err)
 	}
 	if head != nil {
 		res := &ethpb.ChainStartResponse{
-			Started:     true,
-			GenesisTime: head.GenesisTime(),
+			Started:               true,
+			GenesisTime:           head.GenesisTime(),
+			GenesisValidatorsRoot: head.GenesisValidatorRoot(),
 		}
 		return stream.Send(res)
 	}
@@ -176,58 +169,17 @@ func (vs *Server) WaitForChainStart(req *ptypes.Empty, stream ethpb.BeaconNodeVa
 	for {
 		select {
 		case event := <-stateChannel:
-			if event.Type == statefeed.ChainStarted {
-				data, ok := event.Data.(*statefeed.ChainStartedData)
+			if event.Type == statefeed.Initialized {
+				data, ok := event.Data.(*statefeed.InitializedData)
 				if !ok {
-					return errors.New("event data is not type *statefeed.ChainStartData")
+					return errors.New("event data is not type *statefeed.InitializedData")
 				}
 				log.WithField("starttime", data.StartTime).Debug("Received chain started event")
-				log.Info("Sending genesis time notification to connected validator clients")
+				log.Debug("Sending genesis time notification to connected validator clients")
 				res := &ethpb.ChainStartResponse{
-					Started:     true,
-					GenesisTime: uint64(data.StartTime.Unix()),
-				}
-				return stream.Send(res)
-			}
-		case <-stateSub.Err():
-			return status.Error(codes.Aborted, "Subscriber closed, exiting goroutine")
-		case <-vs.Ctx.Done():
-			return status.Error(codes.Canceled, "Context canceled")
-		}
-	}
-}
-
-// WaitForSynced subscribes to the state channel and ends the stream when the state channel
-// indicates the beacon node has been initialized and is ready
-func (vs *Server) WaitForSynced(req *ptypes.Empty, stream ethpb.BeaconNodeValidator_WaitForSyncedServer) error {
-	head, err := vs.HeadFetcher.HeadState(context.Background())
-	if err != nil {
-		return status.Errorf(codes.Internal, "Could not retrieve head state: %v", err)
-	}
-	if head != nil && !vs.SyncChecker.Syncing() {
-		res := &ethpb.SyncedResponse{
-			Synced:      true,
-			GenesisTime: head.GenesisTime(),
-		}
-		return stream.Send(res)
-	}
-
-	stateChannel := make(chan *feed.Event, 1)
-	stateSub := vs.StateNotifier.StateFeed().Subscribe(stateChannel)
-	defer stateSub.Unsubscribe()
-	for {
-		select {
-		case event := <-stateChannel:
-			if event.Type == statefeed.Synced {
-				data, ok := event.Data.(*statefeed.SyncedData)
-				if !ok {
-					return errors.New("event data is not type *statefeed.SyncedData")
-				}
-				log.WithField("starttime", data.StartTime).Debug("Received sync completed event")
-				log.Info("Sending genesis time notification to connected validator clients")
-				res := &ethpb.SyncedResponse{
-					Synced:      true,
-					GenesisTime: uint64(data.StartTime.Unix()),
+					Started:               true,
+					GenesisTime:           uint64(data.StartTime.Unix()),
+					GenesisValidatorsRoot: data.GenesisValidatorsRoot,
 				}
 				return stream.Send(res)
 			}

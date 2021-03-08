@@ -5,6 +5,7 @@ import (
 	"context"
 
 	"github.com/pkg/errors"
+	types "github.com/prysmaticlabs/eth2-types"
 	"github.com/prysmaticlabs/prysm/beacon-chain/core/helpers"
 	stateTrie "github.com/prysmaticlabs/prysm/beacon-chain/state"
 	pb "github.com/prysmaticlabs/prysm/proto/beacon/p2p/v1"
@@ -13,10 +14,6 @@ import (
 	"github.com/prysmaticlabs/prysm/shared/traceutil"
 	"go.opencensus.io/trace"
 )
-
-// Balances stores balances such as prev/current total validator balances, attested balances and more.
-// It's used for metrics reporting.
-var Balances *Balance
 
 // ProcessAttestations process the attestations in state and update individual validator's pre computes,
 // it also tracks and updates epoch attesting balances.
@@ -33,6 +30,9 @@ func ProcessAttestations(
 	var err error
 
 	for _, a := range append(state.PreviousEpochAttestations(), state.CurrentEpochAttestations()...) {
+		if a.InclusionDelay == 0 {
+			return nil, nil, errors.New("attestation with inclusion delay of 0")
+		}
 		v.IsCurrentEpochAttester, v.IsCurrentEpochTargetAttester, err = AttestedCurrentEpoch(state, a)
 		if err != nil {
 			traceutil.AnnotateError(span, err)
@@ -48,12 +48,14 @@ func ProcessAttestations(
 		if err != nil {
 			return nil, nil, err
 		}
-		indices := attestationutil.AttestingIndices(a.AggregationBits, committee)
+		indices, err := attestationutil.AttestingIndices(a.AggregationBits, committee)
+		if err != nil {
+			return nil, nil, err
+		}
 		vp = UpdateValidator(vp, v, indices, a, a.Data.Slot)
 	}
 
 	pBal = UpdateBalance(vp, pBal)
-	Balances = pBal
 
 	return vp, pBal, nil
 }
@@ -105,7 +107,7 @@ func AttestedPrevEpoch(s *stateTrie.BeaconState, a *pb.PendingAttestation) (bool
 }
 
 // SameTarget returns true if attestation `a` attested to the same target block in state.
-func SameTarget(state *stateTrie.BeaconState, a *pb.PendingAttestation, e uint64) (bool, error) {
+func SameTarget(state *stateTrie.BeaconState, a *pb.PendingAttestation, e types.Epoch) (bool, error) {
 	r, err := helpers.BlockRoot(state, e)
 	if err != nil {
 		return false, err
@@ -129,7 +131,7 @@ func SameHead(state *stateTrie.BeaconState, a *pb.PendingAttestation) (bool, err
 }
 
 // UpdateValidator updates pre computed validator store.
-func UpdateValidator(vp []*Validator, record *Validator, indices []uint64, a *pb.PendingAttestation, aSlot uint64) []*Validator {
+func UpdateValidator(vp []*Validator, record *Validator, indices []uint64, a *pb.PendingAttestation, aSlot types.Slot) []*Validator {
 	inclusionSlot := aSlot + a.InclusionDelay
 
 	for _, i := range indices {
